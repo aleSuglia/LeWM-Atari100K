@@ -1,0 +1,123 @@
+defaults:
+  - _self_
+  - env: atari
+  - model: lewm
+
+seed: 0
+game: pong
+device: cuda
+
+# -----------------------------------------------------------------------------
+# Shared model/data dimensions
+# -----------------------------------------------------------------------------
+
+img_size: 224
+embed_dim: 192
+history_size: 3
+
+# -----------------------------------------------------------------------------
+# Loss weighting
+# -----------------------------------------------------------------------------
+loss_weights:
+  pred_loss: 1
+  sigreg_loss: 0.25
+  rew_loss: 0.1
+  don_loss: 0.1
+
+# -----------------------------------------------------------------------------
+# Imagination
+# -----------------------------------------------------------------------------
+imagination:
+  max_horizon: 75
+  env_id: ${game}
+  history_size: ${history_size}
+  embed_dim: ${embed_dim}
+  done_threshold: 0.5
+
+# -----------------------------------------------------------------------------
+# Training schedule
+# -----------------------------------------------------------------------------
+trainer:
+  total_epochs: 500
+  
+  devices: auto
+  accelerator: gpu
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+
+  optimizer:
+    type: AdamW
+    lr: 5e-5
+    weight_decay: 1e-3
+
+  sanity_eval:
+    every_x_epoch: 20
+    episodes: 3
+    per_episode_limit: 5000
+
+collection_trainer:
+  collection_limit: 110_000                             # Completion = 440
+  collection_per_epoch: 250
+
+world_model_trainer:
+  world_model_start_epoch: 10
+  world_model_stop_epoch: 460
+  world_model_epochs: 15
+
+agent_trainer:
+  agent_start_epoch: 20
+
+  total_steps: 500_000
+  per_rollout_steps: 30
+
+# -----------------------------------------------------------------------------
+# Evaluation
+# -----------------------------------------------------------------------------
+eval:
+  episodes: 25
+  deterministic: true                                     # Not implemented
+  per_episode_limit: 25000
+  output_path: ./eval/${game}.json
+
+# -----------------------------------------------------------------------------
+# Agent
+# -----------------------------------------------------------------------------
+agent:
+  algorithm: ppo
+  policy: MlpPolicy
+
+# -----------------------------------------------------------------------------
+# Checkpointing
+# -----------------------------------------------------------------------------
+checkpointing:
+  wm_per_epoch: 50
+  agent_per_epoch: 50
+  wm_path: ./checkpoints/${game}/world_model
+  agent_path: ./checkpoints/${game}/agent
+
+# -----------------------------------------------------------------------------
+# DataLoader
+# -----------------------------------------------------------------------------
+loader:
+  batch_size: 64
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 3
+
+# -----------------------------------------------------------------------------
+# Replay storage
+# -----------------------------------------------------------------------------
+replay:
+  _target_: replay.replay.Replay 
+  path: ./data/${game}.h5
+  obs_shape: [3, "${img_size}", "${img_size}"]
+
+# -----------------------------------------------------------------------------
+# Sequence dataset
+# -----------------------------------------------------------------------------
+dataset:
+  _target_: replay.replay.ReplaySequenceDataset
+  path: ${replay.path}
+  seq_len: 32
+  allow_cross_episode: false
