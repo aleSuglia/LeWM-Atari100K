@@ -273,9 +273,6 @@ def run(cfg):
     # Tracking values
     total_collected_interactions = 0
     collection_size = cfg.collection_trainer.collection_per_epoch
-    num_imagine_interactions = int(
-        cfg.agent_trainer.total_steps / cfg.agent_trainer.per_rollout_steps
-    )
 
     # Creating directories for checkpointing
     wm_ckp_dir = Path(cfg.checkpointing.wm_path)
@@ -339,13 +336,11 @@ def run(cfg):
         
         # Training Agent
         if(epoch_idx+1 >= cfg.agent_trainer.agent_start_epoch):
-            for _ in range(num_imagine_interactions):
-                agent.learn(
-                    cfg.agent_trainer.per_rollout_steps,
-                    callback=agent_wandb_callback,
-                    reset_num_timesteps=False,
-                    log_interval=1,
-                )
+            agent.learn(
+                cfg.agent_trainer.total_steps,
+                callback=agent_wandb_callback,
+                reset_num_timesteps=False,
+            )
 
         # Checkpointing Agent
         if((epoch_idx+1) % cfg.checkpointing.agent_per_epoch == 0):

@@ -29,7 +29,7 @@ loss_weights:
 # Imagination
 # -----------------------------------------------------------------------------
 imagination:
-  max_horizon: 75
+  max_horizon: 50
   env_id: ${game}
   history_size: ${history_size}
   embed_dim: ${embed_dim}
@@ -67,9 +67,7 @@ world_model_trainer:
 
 agent_trainer:
   agent_start_epoch: 20
-
   total_steps: 500_000
-  per_rollout_steps: 30
 
 # -----------------------------------------------------------------------------
 # Evaluation
