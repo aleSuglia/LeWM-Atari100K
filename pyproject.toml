@@ -13,6 +13,7 @@ dependencies = [
     "omegaconf>=2.3.1",
     "stable-baselines3>=2.9.0",
     "stable-pretraining",
+    "tensorboard>=2.20.0",
     "torch>=2.12.0",
 ]
 

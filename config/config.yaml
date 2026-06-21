@@ -86,6 +86,7 @@ eval:
 agent:
   algorithm: ppo
   policy: MlpPolicy
+  tensorboard_logs: ./tensorboard
 
 # -----------------------------------------------------------------------------
 # Checkpointing

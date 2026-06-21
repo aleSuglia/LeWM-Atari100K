@@ -3,8 +3,11 @@ from pathlib import Path
 import torch
 from stable_baselines3 import PPO, DQN, A2C
 
+from omegaconf import OmegaConf
+import wandb
+from wandb.integration.sb3 import WandbCallback
 
-def get_agent(cfg, env, device):
+def get_agent(cfg, env, tb_logs, device):
     """
     Get agent based on config
     """
@@ -21,6 +24,7 @@ def get_agent(cfg, env, device):
     agent = alg_cls(
         policy=cfg.policy,
         env=env,
+        tensorboard_log=tb_logs,
         device=device,
     )
 
@@ -47,3 +51,28 @@ def build_optimizer(parameters, optimizer_cfg):
         lr=lr,
         weight_decay=weight_decay,
     )
+
+def try_wandb_init(cfg):
+    """
+    """
+    if cfg.local.wandb.enabled:
+        config_dict = OmegaConf.to_container(cfg, resolve=True)
+
+        run =  wandb.init(
+            project=cfg.local.wandb.project,
+            entity=cfg.local.wandb.entity,
+            config=config_dict,
+            sync_tensorboard=True,
+        )
+
+        agent_wandb_callback = WandbCallback(log='all', verbose=1)
+
+        return run, agent_wandb_callback
+    else:
+        return None, None
+
+def log_wandb(run, metrics, global_epoch):
+    """
+    """
+    if run is not None and metrics:
+        run.log(metrics, step=global_epoch)

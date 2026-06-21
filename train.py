@@ -9,7 +9,7 @@ import hydra
 from omegaconf import OmegaConf
 
 from lewm.imagination import ImaginationEnv
-from utils import get_agent, build_optimizer
+from utils import get_agent, build_optimizer, try_wandb_init, log_wandb
 
 
 def collect_real_interactions(
@@ -82,10 +82,10 @@ def train_world_model(
         **loader_cfg
     )
 
-    for epoch_idx in range(num_epochs):
-        loss_tracker = None
-        num_batches = 0
+    global_loss_tracker = None
+    num_total_batches = 0
 
+    for epoch_idx in range(num_epochs):
         for batch in dataloader:
             observations = batch['obs'].to(device, non_blocking=True).float()
             actions = batch['action'].to(device, non_blocking=True).long()
@@ -123,18 +123,18 @@ def train_world_model(
                 for name, value in losses.items()
             }
 
-            if loss_tracker is None:
-                loss_tracker = {name: 0.0 for name in detached_losses}
+            if global_loss_tracker is None:
+                global_loss_tracker = {name: 0.0 for name in detached_losses}
             
             for name, value in detached_losses.items():
-                loss_tracker[name] += value
+                global_loss_tracker[name] += value
             
-            num_batches += 1
-
-            history = {
-                'epoch': epoch_idx,
-                **{name: value / num_batches for name, value in loss_tracker.items()}
-            }
+            num_total_batches += 1
+    
+    return {
+        name: value / num_total_batches
+        for name, value in global_loss_tracker.items()
+    }
 
 def eval_agent(
         episodes,
@@ -187,19 +187,21 @@ def eval_agent(
         reward_history.append(total_return)
         length_history.append(length)
 
+    result = {
+        "episodes": episodes,
+        "ep_rewards": reward_history,
+        "ep_lengths": length_history,
+        "mean_reward": np.mean(reward_history),
+        "std_reward": np.std(reward_history),
+        "mean_length": np.mean(length_history)
+    }
+
     if at_end:
-        result = {
-            "episodes": episodes,
-            "ep_rewards": reward_history,
-            "ep_lengths": length_history,
-            "mean_reward": np.mean(reward_history),
-            "std_reward": np.std(reward_history),
-            "mean_length": np.mean(length_history)
-        }
         output_path = Path(eval_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(result, indent=2), encoding='utf-8')
-
+    
+    return result
 
 @hydra.main(version_base=None, config_path='./config', config_name='dummy')
 def run(cfg):
@@ -226,6 +228,9 @@ def run(cfg):
         merge=False,
     )
 
+    # W&B
+    wandb_run, agent_wandb_callback = try_wandb_init(cfg)
+
     # World Model
     world_model = hydra.utils.instantiate(cfg.model)
     world_model.to(cfg.device)
@@ -248,7 +253,8 @@ def run(cfg):
     agent = get_agent(
         cfg.agent,
         env=imagination_env,
-        device=cfg.device
+        tb_logs=cfg.agent.tensorboard_logs,
+        device='cpu'                                # Efficiency
     )
 
     #########################
@@ -294,11 +300,17 @@ def run(cfg):
                 device=cfg.device,
             )
 
+        log_wandb(
+            wandb_run,
+            {'replay/collection_size': replay_writer.size},
+            epoch_idx
+        )
+
         # Training World Model
         if(
             (epoch_idx+1 >= cfg.world_model_trainer.world_model_start_epoch) and (epoch_idx+1 <= cfg.world_model_trainer.world_model_stop_epoch)
         ):
-            train_world_model(
+            wm_losses = train_world_model(
                 num_epochs=cfg.world_model_trainer.world_model_epochs,
                 world_model=world_model,
                 dataset=dataset,
@@ -310,18 +322,31 @@ def run(cfg):
                 device=cfg.device,
             )
 
+            log_wandb(
+                wandb_run,
+                {
+                    f"world_model/{key}": value
+                    for key, value in wm_losses.items()
+                },
+                epoch_idx
+            )
+
         # Checkpointing World Model
         if((epoch_idx+1) % cfg.checkpointing.wm_per_epoch == 0):
             file_name = f"epoch_{epoch_idx+1}.pt"
             wm_ckp_path = wm_ckp_dir / file_name
             torch.save(world_model.state_dict(), wm_ckp_path)
-
         
         # Training Agent
         if(epoch_idx+1 >= cfg.agent_trainer.agent_start_epoch):
             for _ in range(num_imagine_interactions):
-                agent.learn(cfg.agent_trainer.per_rollout_steps)
-        
+                agent.learn(
+                    cfg.agent_trainer.per_rollout_steps,
+                    callback=agent_wandb_callback,
+                    reset_num_timesteps=False,
+                    log_interval=1,
+                )
+
         # Checkpointing Agent
         if((epoch_idx+1) % cfg.checkpointing.agent_per_epoch == 0):
             file_name = f"epoch_{epoch_idx+1}"
@@ -330,7 +355,7 @@ def run(cfg):
 
         # Sanity Eval Checks
         if((epoch_idx + 1) % cfg.trainer.sanity_eval.every_x_epoch == 0):
-            eval_agent(
+            sanity_eval = eval_agent(
                 episodes=cfg.trainer.sanity_eval.episodes,
                 per_episode_limit=cfg.trainer.sanity_eval.per_episode_limit,
                 agent=agent,
@@ -338,6 +363,14 @@ def run(cfg):
                 world_model=world_model,
                 device=cfg.device,
                 at_end=False,
+            )
+            log_wandb(
+                wandb_run,
+                {
+                    'sanity_eval/mean_rew': sanity_eval["mean_reward"],
+                    'sanity_eval/mean_len': sanity_eval['mean_length'],
+                },
+                epoch_idx
             )
 
     # Checkpointing Final World Model
@@ -369,6 +402,8 @@ def run(cfg):
     atari_env.close()
     replay_writer.close()
     dataset.close()
+    if wandb_run is not None:
+        wandb_run.finish()
     
 if __name__ == "__main__":
     run()
