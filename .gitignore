@@ -13,6 +13,11 @@ wheels/
 data
 datasets
 
+# Output
+outputs
+checkpoints
+eval
+
 # Experimentation
 playground/
 testing.ipynb

@@ -1,5 +1,6 @@
 defaults:
   - _self_
+  - local: log
   - env: atari
   - model: lewm
 

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import torch
 from stable_baselines3 import PPO, DQN, A2C
 
@@ -24,7 +26,7 @@ def get_agent(cfg, env, device):
 
     return agent
 
-def _build_optimizer(parameters, optimizer_cfg):
+def build_optimizer(parameters, optimizer_cfg):
     """
     """
     optim_type = str(getattr(optimizer_cfg, "type", "AdamW")).lower()
@@ -45,4 +47,3 @@ def _build_optimizer(parameters, optimizer_cfg):
         lr=lr,
         weight_decay=weight_decay,
     )
-

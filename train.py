@@ -9,7 +9,7 @@ import hydra
 from omegaconf import OmegaConf
 
 from lewm.imagination import ImaginationEnv
-from utils import get_agent, _build_optimizer
+from utils import get_agent, build_optimizer
 
 
 def collect_real_interactions(
@@ -56,8 +56,6 @@ def collect_real_interactions(
         needs_reset = terminated or truncated
 
     writer.flush()
-    print("how much data is in the file: ", writer.size)
-
     return obs
 
 def train_world_model(
@@ -137,7 +135,6 @@ def train_world_model(
                 'epoch': epoch_idx,
                 **{name: value / num_batches for name, value in loss_tracker.items()}
             }
-            print("training loss", history)
 
 def eval_agent(
         episodes,
@@ -189,10 +186,6 @@ def eval_agent(
         
         reward_history.append(total_return)
         length_history.append(length)
-    
-    print("eval mean return is ", np.mean(reward_history))
-    print("eval std is ", np.std(reward_history))
-    print("eval mean length is ", np.mean(length_history))
 
     if at_end:
         result = {
@@ -210,9 +203,7 @@ def eval_agent(
 
 @hydra.main(version_base=None, config_path='./config', config_name='dummy')
 def run(cfg):
-    #########################
-    ##         Seed        ##
-    #########################
+    # Seeding
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
@@ -224,9 +215,7 @@ def run(cfg):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    #########################
-    ##      Atari Env      ##
-    #########################
+    # Atari Env
     atari_env = hydra.utils.instantiate(cfg.env)
     num_actions = atari_env.num_actions
 
@@ -237,25 +226,17 @@ def run(cfg):
         merge=False,
     )
 
-    #########################
-    ##     World Model     ##
-    #########################
+    # World Model
     world_model = hydra.utils.instantiate(cfg.model)
     world_model.to(cfg.device)
 
-    #########################
-    ##        Replay       ##
-    #########################
+    # Replay Writer
     replay_writer = hydra.utils.instantiate(cfg.replay)
 
-    #########################
-    ##       Dataset       ##
-    #########################
+    # Dataset
     dataset = hydra.utils.instantiate(cfg.dataset)
 
-    #########################
-    ##     Imagination     ##
-    #########################
+    # Imagination Env
     imagination_env = ImaginationEnv(
         num_actions=num_actions,
         world_model=world_model,
@@ -263,9 +244,7 @@ def run(cfg):
         **cfg.imagination
     )
 
-    #########################
-    ##        Agent        ##
-    #########################
+    # Agent
     agent = get_agent(
         cfg.agent,
         env=imagination_env,
@@ -276,19 +255,30 @@ def run(cfg):
     ##      Training       ##
     #########################
 
+    # Initial observation
     obs, _ = atari_env.reset(seed=cfg.seed)
 
-    wm_optimizer = _build_optimizer(
+    # World Model optimizer
+    wm_optimizer = build_optimizer(
         world_model.parameters(),
         cfg.trainer.optimizer,
     )
 
+    # Tracking values
     total_collected_interactions = 0
     collection_size = cfg.collection_trainer.collection_per_epoch
     num_imagine_interactions = int(
         cfg.agent_trainer.total_steps / cfg.agent_trainer.per_rollout_steps
     )
 
+    # Creating directories for checkpointing
+    wm_ckp_dir = Path(cfg.checkpointing.wm_path)
+    wm_ckp_dir.mkdir(parents=True, exist_ok=True)
+
+    agent_ckp_dir = Path(cfg.checkpointing.agent_path)
+    agent_ckp_dir.mkdir(parents=True, exist_ok=True)
+
+    # Training Loop
     for epoch_idx in range(cfg.trainer.total_epochs):
         
         # Collection
@@ -320,13 +310,24 @@ def run(cfg):
                 device=cfg.device,
             )
 
+        # Checkpointing World Model
+        if((epoch_idx+1) % cfg.checkpointing.wm_per_epoch == 0):
+            file_name = f"epoch_{epoch_idx+1}.pt"
+            wm_ckp_path = wm_ckp_dir / file_name
+            torch.save(world_model.state_dict(), wm_ckp_path)
+
+        
         # Training Agent
-        print("training agent going awol")
         if(epoch_idx+1 >= cfg.agent_trainer.agent_start_epoch):
             for _ in range(num_imagine_interactions):
                 agent.learn(cfg.agent_trainer.per_rollout_steps)
-                print("agent has finished learning for certain steps")
         
+        # Checkpointing Agent
+        if((epoch_idx+1) % cfg.checkpointing.agent_per_epoch == 0):
+            file_name = f"epoch_{epoch_idx+1}"
+            agent_ckp_path = agent_ckp_dir / file_name
+            agent.save(agent_ckp_path)
+
         # Sanity Eval Checks
         if((epoch_idx + 1) % cfg.trainer.sanity_eval.every_x_epoch == 0):
             eval_agent(
@@ -338,6 +339,16 @@ def run(cfg):
                 device=cfg.device,
                 at_end=False,
             )
+
+    # Checkpointing Final World Model
+    file_name = f"final.pt"
+    wm_ckp_path = wm_ckp_dir / file_name
+    torch.save(world_model.state_dict(), wm_ckp_path)
+
+    # Checkpointing Final Agent
+    file_name = f"final"
+    agent_ckp_path = agent_ckp_dir / file_name
+    agent.save(agent_ckp_path)
 
     #########################
     ##     Evaluation      ##

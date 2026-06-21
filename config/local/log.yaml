@@ -1,0 +1,8 @@
+loguru:
+  level: INFO
+  enqueue: false
+
+wandb:
+  enabled: false
+  project: null
+  entity: null
