@@ -3,6 +3,7 @@ defaults:
   - local: log
   - env: atari
   - model: lewm
+  - agent: ppo
 
 seed: 0
 game: pong
@@ -30,16 +31,14 @@ loss_weights:
 # -----------------------------------------------------------------------------
 imagination:
   max_horizon: 50
-  env_id: ${game}
   history_size: ${history_size}
-  embed_dim: ${embed_dim}
   done_threshold: 0.5
 
 # -----------------------------------------------------------------------------
 # Training schedule
 # -----------------------------------------------------------------------------
 trainer:
-  total_epochs: 500
+  total_epochs: 300
   
   devices: auto
   accelerator: gpu
@@ -51,23 +50,39 @@ trainer:
     lr: 5e-5
     weight_decay: 1e-3
 
-  sanity_eval:
-    every_x_epoch: 20
-    episodes: 3
-    per_episode_limit: 5000
+sanity_eval:
+  every_x_epoch: 25
+  episodes: 5
+  per_episode_limit: 25000
 
 collection_trainer:
-  collection_limit: 110_000                             # Completion = 440
-  collection_per_epoch: 250
+  collection_limit: 110_000                             # Completion = 220
+  collection_per_epoch: 500
 
-world_model_trainer:
-  world_model_start_epoch: 10
-  world_model_stop_epoch: 460
-  world_model_epochs: 15
+wm_schedule:
+  regular_start_epoch: 10
+  regular_epochs: 20
+  periodic_start_epoch: 15
+  period: 5
+  periodic_epochs: 30
+  stop_epoch: 280
 
 agent_trainer:
-  agent_start_epoch: 20
-  total_steps: 500_000
+  agent_start_epoch: 15
+  update_epochs: 5
+  total_steps: 250_000
+
+  gamma: 0.997
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+
+  optimizer:
+    type: AdamW
+    lr: 3e-4
+    weight_decay: 0.0
 
 # -----------------------------------------------------------------------------
 # Evaluation
@@ -77,14 +92,6 @@ eval:
   deterministic: true                                     # Not implemented
   per_episode_limit: 25000
   output_path: ./eval/${game}.json
-
-# -----------------------------------------------------------------------------
-# Agent
-# -----------------------------------------------------------------------------
-agent:
-  algorithm: ppo
-  policy: MlpPolicy
-  tensorboard_logs: ./tensorboard
 
 # -----------------------------------------------------------------------------
 # Checkpointing

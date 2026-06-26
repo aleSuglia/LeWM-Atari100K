@@ -1,137 +1,85 @@
 import torch
-import numpy as np
 
-import gymnasium as gym
-from gymnasium import spaces
-
-class ImaginationEnv(gym.Env):
+class ImaginationEnv:
     """
+    Batched Env
     """
     def __init__(
         self,
         max_horizon,
-        env_id,
-        num_actions,
         world_model,
         history_size,
-        embed_dim,
-        dataset,                # Sequence Dataset
+        dataset,
         done_threshold=0.5,
     ):
-        super().__init__()
-
         self.world_model = world_model
-        self.history_size = history_size
         self.dataset = dataset
+        self.history_size = history_size
 
-        self.env_id = env_id
-        self.num_actions = num_actions
-
-        self.action_space = spaces.Discrete(self.num_actions)
-        self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(embed_dim,),
-            dtype=np.float32,
-        )
-
-        self.device = next(self.world_model.parameters()).device
-
-        self.emb_history = None
-        self.emb_act_history = None
-        
-        self.elapsed = 0
         self.max_horizon = max_horizon
         self.done_threshold = done_threshold
-    
-    def _init_sample(self):
-        """
-        make sure to set drop_last = true in dataloader
-        have T > history_size (this is true generally for the project too)
-        """
-        # Fetch a random datapoint of size (T, C, H, W)
-        idx = np.random.randint(len(self.dataset))
-        obs = self.dataset[idx]['obs']                                          # (T, C, H, W)
-        actions = self.dataset[idx]['action']
 
-        T = obs.shape[0]
+        self.device = next(world_model.parameters()).device
 
-        if not (T >= self.history_size):
-            raise RuntimeError("T < history_size")
+        self.elapsed = None
+        self.emb_history = None
+        self.emb_act_history = None
+
+    @torch.no_grad()
+    def _sample_context(self, batch_size):
+        obs, actions = [], []
         
-        # Pick a random starting point
-        start = np.random.randint(0, T - self.history_size + 1)
-
-        # Cut based on start and history size
-        obs = obs[start : start + self.history_size]                                # (H, C, H_img, W_img)
-        actions = actions[start : start + self.history_size]
+        for idx in torch.randint(len(self.dataset), (batch_size,)):
+            sample = self.dataset[int(idx)]
+            T = sample['obs'].shape[0]
+            start = int(torch.randint(T - self.history_size + 1, (1,)))
+            
+            obs.append(sample['obs'][start:start + self.history_size])
+            actions.append(sample['action'][start:start + self.history_size])
         
-        obs = obs.to(self.device).unsqueeze(0)                                      # (1, H, C, H_img, W_img)
-        actions = actions.to(self.device).unsqueeze(0)
+        obs = torch.stack(obs).to(self.device).float()
+        actions = torch.stack(actions).to(self.device).long()
+        
+        emb = self.world_model.encode(obs)
+        act_emb = self.world_model.encode_action(actions)
+        return emb, act_emb[:, :-1]
 
-        with torch.no_grad():
-            emb = self.world_model.encode(obs)                                      # (1, H, Z)
-            emb_act = self.world_model.encode_action(actions)
+    @torch.no_grad()
+    def reset(self, batch_size=None, mask=None):
+        if mask is None:
+            self.elapsed = torch.zeros(batch_size, device=self.device)
+            self.emb_history, self.emb_act_history = self._sample_context(batch_size)
+            return self.emb_history[:, -1]
+        
+        emb, act_emb = self._sample_context(int(mask.sum()))
+        
+        self.elapsed[mask] = 0
+        self.emb_history[mask] = emb
+        self.emb_act_history[mask] = act_emb
+        
+        return self.emb_history[:, -1]
 
-        # Leave last action as that will be passed by step() function
-        self.emb_history = emb                                                      # (1, H, Z)
-        self.emb_act_history = emb_act[:, :-1]                                      # (1, H-1, Z)
-
-        return emb[:, -1].squeeze(0).detach().cpu().numpy().astype(np.float32)      # (Z)
-
-
-    def reset(self, seed = None):
-        super().reset(seed=seed)        
-        self.elapsed = 0
-
-        return self._init_sample(), {}
-    
+    @torch.no_grad()
     def step(self, action):
-        action_tensor = torch.tensor([int(action)], device = self.device).unsqueeze(0)
-        
-        # Encoding the action and then predicting next values
-        with torch.no_grad():
-            emb_act = self.world_model.encode_action(action_tensor)
-            self.emb_act_history = torch.cat([self.emb_act_history, emb_act], dim = 1)
+        act_emb = self.world_model.encode_action(action).unsqueeze(1)
+        self.emb_act_history = torch.cat([self.emb_act_history, act_emb], dim=1)
 
-            nxt_emb, nxt_rew, nxt_don = self.world_model.transition(
-                self.emb_history, self.emb_act_history
-            )
-        
-        # Handling the recieved rewards
-        reward = float(nxt_rew.squeeze().detach().cpu()) if nxt_rew is not None else 0.0
+        next_emb, reward, done_logit = self.world_model.transition(self.emb_history, self.emb_act_history)
+        next_emb = next_emb.squeeze(1)
+        reward = reward.squeeze(-1)
 
-        # Computing terminated flag
-        done_probability = 0.0
-        terminated = False
-        if nxt_don is not None:
-            done_probability = torch.sigmoid(nxt_don.squeeze()).item()
-            terminated = (done_probability >= self.done_threshold)
+        terminated = torch.sigmoid(done_logit.squeeze(-1)) >= self.done_threshold
         
-        # Computing truncated flag
         self.elapsed += 1
-        truncated = (self.elapsed >= self.max_horizon)
-
-        info = {
-            "done_probability": done_probability,
-            "elapsed_steps": self.elapsed,
-        }
-
-        # Resetting the env if the previous rollout is done
-        if terminated or truncated:
-            nxt_emb, _ = self.reset()
-            nxt_emb = torch.from_numpy(nxt_emb).to(self.device)
-            nxt_emb = nxt_emb.unsqueeze(0).unsqueeze(0)
-
-        # Adding the recieved embedding to history
-        self.emb_history = torch.cat([self.emb_history, nxt_emb], dim=1)
-
-        # Updating history for efficiency
-        self.emb_history = self.emb_history[:, -self.history_size:]
-            # Take only last two actions, the other will be added at step()
+        truncated = self.elapsed >= self.max_horizon
+        
+        done = terminated | truncated
+        
+        self.emb_history = torch.cat([self.emb_history, next_emb.unsqueeze(1)], dim=1)[:, -self.history_size:]
         self.emb_act_history = self.emb_act_history[:, -self.history_size + 1:]
-
-        # Preparing the agent observation
-        agent_obs = nxt_emb.squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32)
-
-        return agent_obs, reward, terminated, truncated, info
+        
+        if done.any():
+            self.reset(mask=done)
+            next_emb = torch.where(done[:, None], self.emb_history[:, -1], next_emb)
+        
+        return next_emb, reward, done, {'terminated': terminated, 'truncated': truncated}

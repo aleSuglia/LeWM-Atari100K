@@ -9,7 +9,7 @@ import hydra
 from omegaconf import OmegaConf
 
 from lewm.imagination import ImaginationEnv
-from utils import get_agent, build_optimizer, try_wandb_init, log_wandb
+from utils import build_optimizer, try_wandb_init, log_wandb
 
 
 def collect_real_interactions(
@@ -24,9 +24,9 @@ def collect_real_interactions(
     """
     collect given number of real interactions
     """
+    agent.eval()
     world_model.eval()
     
-    # Handles env.reset() externally as its necessary for data collection
     needs_reset = False
 
     for _ in range(num_interactions):
@@ -36,9 +36,9 @@ def collect_real_interactions(
         obs = torch.from_numpy(obs).unsqueeze(0).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            emb = world_model.encode(obs).squeeze(0).squeeze(0)
-            action, _ = agent.predict(
-                emb.cpu().numpy(),
+            emb = world_model.encode(obs)
+            action = agent.predict(
+                emb,
                 deterministic=False,    # Exploration
             )
 
@@ -117,7 +117,6 @@ def train_world_model(
 
             optimizer.step()
 
-            ##### Tracking #####
             detached_losses = {
                 name: float(value.detach().clone().cpu())
                 for name, value in losses.items()
@@ -140,11 +139,11 @@ def eval_agent(
         episodes,
         per_episode_limit,
         agent,
-        real_env,
-        world_model, 
+        world_model,
+        env_cfg,
         device,
+        seed,
         at_end=False,
-        seed=None,
         eval_path=None,
 ):
     """
@@ -154,11 +153,10 @@ def eval_agent(
     reward_history = []
     length_history = []
 
+    eval_env = hydra.utils.instantiate(env_cfg)
+
     for ep_idx in range(episodes):
-        if not at_end:
-            obs, _ = real_env.reset()
-        else:
-            obs, _ = real_env.reset(seed + ep_idx)
+        obs, _ = eval_env.reset(seed + ep_idx)
 
         done = False
         total_return  = 0.0
@@ -168,13 +166,13 @@ def eval_agent(
             obs = torch.from_numpy(obs).unsqueeze(0).unsqueeze(0).to(device)
 
             with torch.no_grad():
-                emb = world_model.encode(obs).squeeze(0).squeeze(0)
-                action, _ = agent.predict(
-                    emb.cpu().numpy(),
+                emb = world_model.encode(obs)
+                action = agent.predict(
+                    emb,
                     deterministic=True,    # Exploitation
                 )
             
-            obs, reward, terminated, truncated, info = real_env.step(int(action))
+            obs, reward, terminated, truncated, _ = eval_env.step(int(action))
             
             done = terminated or truncated
 
@@ -187,6 +185,7 @@ def eval_agent(
         reward_history.append(total_return)
         length_history.append(length)
 
+    eval_env.close()
     result = {
         "episodes": episodes,
         "ep_rewards": reward_history,
@@ -203,7 +202,7 @@ def eval_agent(
     
     return result
 
-@hydra.main(version_base=None, config_path='./config', config_name='dummy')
+@hydra.main(version_base=None, config_path='./config', config_name='config')
 def run(cfg):
     # Seeding
     random.seed(cfg.seed)
@@ -227,9 +226,15 @@ def run(cfg):
         int(num_actions),
         merge=False,
     )
+    OmegaConf.update(
+        cfg,
+        'agent.num_actions',
+        int(num_actions),
+        merge=False,
+    )
 
     # W&B
-    wandb_run, agent_wandb_callback = try_wandb_init(cfg)
+    wandb_run = try_wandb_init(cfg)
 
     # World Model
     world_model = hydra.utils.instantiate(cfg.model)
@@ -243,19 +248,13 @@ def run(cfg):
 
     # Imagination Env
     imagination_env = ImaginationEnv(
-        num_actions=num_actions,
         world_model=world_model,
         dataset=dataset,
         **cfg.imagination
     )
 
     # Agent
-    agent = get_agent(
-        cfg.agent,
-        env=imagination_env,
-        tb_logs=cfg.agent.tensorboard_logs,
-        device='cpu'                                # Efficiency
-    )
+    agent = hydra.utils.instantiate(cfg.agent)
 
     #########################
     ##      Training       ##
@@ -269,10 +268,14 @@ def run(cfg):
         world_model.parameters(),
         cfg.trainer.optimizer,
     )
+    agent_optimizer = build_optimizer(
+        agent.parameters(),
+        cfg.agent_trainer.optimizer,
+    )
 
     # Tracking values
     total_collected_interactions = 0
-    collection_size = cfg.collection_trainer.collection_per_epoch
+    collection_per_epoch = cfg.collection_trainer.collection_per_epoch
 
     # Creating directories for checkpointing
     wm_ckp_dir = Path(cfg.checkpointing.wm_path)
@@ -284,11 +287,13 @@ def run(cfg):
     # Training Loop
     for epoch_idx in range(cfg.trainer.total_epochs):
         
+        print("running epoch: ", epoch_idx+1)
+
         # Collection
         if total_collected_interactions < cfg.collection_trainer.collection_limit:
-            total_collected_interactions += collection_size  
+            total_collected_interactions += collection_per_epoch  
             obs = collect_real_interactions(
-                num_interactions=collection_size,
+                num_interactions=collection_per_epoch,
                 obs=obs,
                 agent=agent,
                 world_model=world_model,
@@ -297,18 +302,24 @@ def run(cfg):
                 device=cfg.device,
             )
 
-        log_wandb(
-            wandb_run,
-            {'replay/collection_size': replay_writer.size},
-            epoch_idx
-        )
+            log_wandb(
+                wandb_run,
+                {'replay/collection_size': replay_writer.size},
+                epoch_idx
+            )
 
+            print("collection complete. size: ", replay_writer.size)
+
+        wm_train_epochs = None
+        if cfg.wm_schedule.regular_start_epoch <= (epoch_idx+1) < cfg.wm_schedule.periodic_start_epoch:
+            wm_train_epochs = cfg.wm_schedule.regular_epochs
+        elif cfg.wm_schedule.periodic_start_epoch <= (epoch_idx+1) <= cfg.wm_schedule.stop_epoch and (epoch_idx+1) % cfg.wm_schedule.period == 0:
+            wm_train_epochs = cfg.wm_schedule.periodic_epochs
+        
         # Training World Model
-        if(
-            (epoch_idx+1 >= cfg.world_model_trainer.world_model_start_epoch) and (epoch_idx+1 <= cfg.world_model_trainer.world_model_stop_epoch)
-        ):
+        if wm_train_epochs is not None:
             wm_losses = train_world_model(
-                num_epochs=cfg.world_model_trainer.world_model_epochs,
+                num_epochs=wm_train_epochs,
                 world_model=world_model,
                 dataset=dataset,
                 loader_cfg=cfg.loader,
@@ -327,6 +338,9 @@ def run(cfg):
                 },
                 epoch_idx
             )
+        
+            print("world model training complete. losses:")
+            print(wm_losses)
 
         # Checkpointing World Model
         if((epoch_idx+1) % cfg.checkpointing.wm_per_epoch == 0):
@@ -336,26 +350,39 @@ def run(cfg):
         
         # Training Agent
         if(epoch_idx+1 >= cfg.agent_trainer.agent_start_epoch):
-            agent.learn(
-                cfg.agent_trainer.total_steps,
-                callback=agent_wandb_callback,
-                reset_num_timesteps=False,
+            agent_losses = agent.learn(
+                imagination_env,
+                cfg.agent_trainer,
+                agent_optimizer
             )
+
+            log_wandb(
+                wandb_run,
+                {
+                    f"agent/{key}": value
+                    for key, value in agent_losses.items()
+                },
+                epoch_idx
+            )
+
+            print("agent training done. losses: ")
+            print(agent_losses)
 
         # Checkpointing Agent
         if((epoch_idx+1) % cfg.checkpointing.agent_per_epoch == 0):
-            file_name = f"epoch_{epoch_idx+1}"
+            file_name = f"epoch_{epoch_idx+1}.pt"
             agent_ckp_path = agent_ckp_dir / file_name
-            agent.save(agent_ckp_path)
+            torch.save(agent.state_dict(), agent_ckp_path)
 
         # Sanity Eval Checks
-        if((epoch_idx + 1) % cfg.trainer.sanity_eval.every_x_epoch == 0):
+        if((epoch_idx + 1) % cfg.sanity_eval.every_x_epoch == 0):
             sanity_eval = eval_agent(
-                episodes=cfg.trainer.sanity_eval.episodes,
-                per_episode_limit=cfg.trainer.sanity_eval.per_episode_limit,
+                episodes=cfg.sanity_eval.episodes,
+                per_episode_limit=cfg.sanity_eval.per_episode_limit,
                 agent=agent,
-                real_env=atari_env,
                 world_model=world_model,
+                seed = cfg.seed,
+                env_cfg=cfg.env,
                 device=cfg.device,
                 at_end=False,
             )
@@ -367,6 +394,8 @@ def run(cfg):
                 },
                 epoch_idx
             )
+            print("sanity eval complete. results:")
+            print(sanity_eval)
 
     # Checkpointing Final World Model
     file_name = f"final.pt"
@@ -374,9 +403,9 @@ def run(cfg):
     torch.save(world_model.state_dict(), wm_ckp_path)
 
     # Checkpointing Final Agent
-    file_name = f"final"
+    file_name = f"final.pt"
     agent_ckp_path = agent_ckp_dir / file_name
-    agent.save(agent_ckp_path)
+    torch.save(agent.state_dict(), agent_ckp_path)
 
     #########################
     ##     Evaluation      ##
@@ -386,11 +415,11 @@ def run(cfg):
         episodes=cfg.eval.episodes,
         per_episode_limit=cfg.eval.per_episode_limit,
         agent=agent,
-        real_env=atari_env,
         world_model=world_model,
+        seed = cfg.seed,
+        env_cfg=cfg.env,
         device=cfg.device,
         at_end=True,
-        seed=cfg.seed,
         eval_path=cfg.eval.output_path,
     )
 
