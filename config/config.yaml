@@ -13,7 +13,7 @@ device: cuda
 # Shared model/data dimensions
 # -----------------------------------------------------------------------------
 
-img_size: 224
+img_size: 128
 embed_dim: 192
 history_size: 3
 
@@ -22,15 +22,15 @@ history_size: 3
 # -----------------------------------------------------------------------------
 loss_weights:
   pred_loss: 1
-  sigreg_loss: 0.25
-  rew_loss: 0.1
-  don_loss: 0.1
+  sigreg_loss: 0.3
+  rew_loss: 0.01
+  don_loss: 0.01
 
 # -----------------------------------------------------------------------------
 # Imagination
 # -----------------------------------------------------------------------------
 imagination:
-  max_horizon: 50
+  max_horizon: 70
   history_size: ${history_size}
   done_threshold: 0.5
 
@@ -38,7 +38,7 @@ imagination:
 # Training schedule
 # -----------------------------------------------------------------------------
 trainer:
-  total_epochs: 300
+  total_epochs: 500
   
   devices: auto
   accelerator: gpu
@@ -47,8 +47,8 @@ trainer:
 
   optimizer:
     type: AdamW
-    lr: 5e-5
-    weight_decay: 1e-3
+    lr: 5e-4
+    weight_decay: 0.0
 
 sanity_eval:
   every_x_epoch: 25
@@ -56,21 +56,21 @@ sanity_eval:
   per_episode_limit: 25000
 
 collection_trainer:
-  collection_limit: 110_000                             # Completion = 220
-  collection_per_epoch: 500
+  collection_limit: 110_000                             # Completion = 440
+  collection_per_epoch: 250
 
 wm_schedule:
   regular_start_epoch: 10
-  regular_epochs: 20
-  periodic_start_epoch: 15
+  regular_epochs: 10
+  periodic_start_epoch: 20
   period: 5
   periodic_epochs: 30
-  stop_epoch: 280
+  stop_epoch: 470
 
 agent_trainer:
-  agent_start_epoch: 15
-  update_epochs: 5
-  total_steps: 250_000
+  agent_start_epoch: 20
+  update_epochs: 4
+  total_steps: 500_000
 
   gamma: 0.997
   gae_lambda: 0.95

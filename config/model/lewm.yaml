@@ -3,7 +3,7 @@ _target_: lewm.lewm.LeWM
 encoder:
   _target_: stable_pretraining.backbone.utils.vit_hf
   size: tiny                                                        # Decides output dimension (== embed_dim)
-  patch_size: 14
+  patch_size: 8
   image_size: ${img_size}
   pretrained: false
   use_mask_token: false
