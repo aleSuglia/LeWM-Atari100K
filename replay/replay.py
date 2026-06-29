@@ -7,7 +7,6 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-
 class Replay:
     """Simple inspectable one-game HDF5 replay store.
 
@@ -240,11 +239,15 @@ class ReplaySequenceDataset(Dataset):
         self,
         path,
         seq_len: int,
+        batch_size: int,
+        num_batches: int,
         allow_cross_episode: bool = False,
         keys: Sequence[str] = ("obs", "action", "reward", "done"),
     ):
         self.path = Path(path)
         self.seq_len = int(seq_len)
+        self.batch_size = int(batch_size)
+        self.num_batches = int(num_batches)
         self.keys = tuple(keys)
         self.allow_cross_episode = allow_cross_episode
 
@@ -254,6 +257,7 @@ class ReplaySequenceDataset(Dataset):
         self.num_episodes = 0
         self.metadata = {}
         self.valid_starts = np.array([], dtype=np.int64)
+        self.chosen_starts = np.array([], dtype=np.int64)
 
         self.refresh()
 
@@ -264,8 +268,8 @@ class ReplaySequenceDataset(Dataset):
         flushed the HDF5 file.
 
         This method closes any currently open read handle, reopens the file
-        briefly, reloads the replay length and episode metadata, and rebuilds
-        self.valid_starts.
+        briefly, reloads the replay length and episode metadata, rebuilds
+        self.valid_starts, and samples self.chosen_starts.
         """
         self.close()
 
@@ -277,8 +281,9 @@ class ReplaySequenceDataset(Dataset):
             self.metadata = json.loads(metadata_json)
 
             self.valid_starts = self._build_valid_starts(f)
+            self.chosen_starts = self._build_chosen_starts()
 
-        return len(self.valid_starts)
+        return len(self.chosen_starts)
 
     def _build_valid_starts(self, f):
         if self.num_steps < self.seq_len:
@@ -311,16 +316,35 @@ class ReplaySequenceDataset(Dataset):
         
         return valid_starts
 
+    def _build_chosen_starts(self):
+        num_chosen = self.batch_size * self.num_batches
+
+        if len(self.valid_starts) == 0:
+            return np.array([], dtype=np.int64)
+
+        num_second_half = int(np.ceil(num_chosen * 0.7))
+        num_anywhere = num_chosen - num_second_half
+
+        second_half_starts = self.valid_starts[self.valid_starts >= self.num_steps // 2]
+
+        chosen_starts = np.concatenate([
+            np.random.choice(second_half_starts, size=num_second_half, replace=True),
+            np.random.choice(self.valid_starts, size=num_anywhere, replace=True),
+        ])
+        np.random.shuffle(chosen_starts)
+
+        return chosen_starts.astype(np.int64)
+
     def _ensure_open(self):
         if self._file is None:
             self._file = h5py.File(self.path, "r")
         return self._file
 
     def __len__(self):
-        return len(self.valid_starts)
+        return len(self.chosen_starts)
 
     def __getitem__(self, idx):
-        start = int(self.valid_starts[idx])
+        start = int(self.chosen_starts[idx])
         end = start + self.seq_len
 
         f = self._ensure_open()
@@ -357,58 +381,3 @@ class ReplaySequenceDataset(Dataset):
 
     def __del__(self):
         self.close()
-
-"""Usage
---------------------------------------------------------------------
-from torch.utils.data import DataLoader
-
-dataset = ReplaySequenceDataset(
-    "data/replay.h5",
-    seq_len=64,
-    allow_cross_episode=False,
-)
-
-loader = DataLoader(
-    dataset,
-    batch_size=32,
-    shuffle=True,
-    num_workers=4,
-    pin_memory=True,
-)
-
-for batch in loader:
-    obs = batch["obs"]          # [B, T, C, H, W]
-    action = batch["action"]    # [B, T]
-    reward = batch["reward"]    # [B, T]
-    done = batch["done"]        # [B, T]
-
-    # world model training here
-
-----------------------------------------------------------------------
-
-# Phase 1: collect data
-with Replay("data/replay.h5", obs_shape=(224, 224, 3), mode="w") as replay:
-    for step in range(num_steps):
-        replay.append(
-            obs=obs,
-            action=action,
-            reward=reward,
-            done=done,
-            episode_id=episode_id,
-            step_index=step_index,
-        )
-
-# Phase 2: train from frozen replay
-dataset = HDF5ReplaySequenceDataset("data/replay.h5", seq_len=64)
-
-loader = DataLoader(
-    dataset,
-    batch_size=32,
-    shuffle=True,
-    num_workers=4,
-)
-
-for batch in loader:
-    ...
-
-"""

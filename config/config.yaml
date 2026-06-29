@@ -15,7 +15,7 @@ device: cuda
 
 img_size: 128
 embed_dim: 192
-history_size: 3
+history_size: 6
 
 # -----------------------------------------------------------------------------
 # Loss weighting
@@ -47,30 +47,31 @@ trainer:
 
   optimizer:
     type: AdamW
-    lr: 5e-4
+    lr: 1e-4
     weight_decay: 0.0
 
 sanity_eval:
   every_x_epoch: 25
   episodes: 5
-  per_episode_limit: 25000
+  per_episode_limit: 10000
 
 collection_trainer:
   collection_limit: 110_000                             # Completion = 440
   collection_per_epoch: 250
 
 wm_schedule:
-  regular_start_epoch: 10
-  regular_epochs: 10
+  steps_per_epoch: 256
+  start_epoch: 10
+  regular_epochs: 5
   periodic_start_epoch: 20
   period: 5
-  periodic_epochs: 30
+  periodic_epochs: 20
   stop_epoch: 470
 
 agent_trainer:
   agent_start_epoch: 20
   update_epochs: 4
-  total_steps: 500_000
+  total_steps: 1_000_000
 
   gamma: 0.997
   gae_lambda: 0.95
@@ -126,5 +127,7 @@ replay:
 dataset:
   _target_: replay.replay.ReplaySequenceDataset
   path: ${replay.path}
+  batch_size: ${loader.batch_size}
+  num_batches: ${wm_schedule.steps_per_epoch}
   seq_len: 32
   allow_cross_episode: false

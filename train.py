@@ -11,7 +11,6 @@ from omegaconf import OmegaConf
 from lewm.imagination import ImaginationEnv
 from utils import build_optimizer, try_wandb_init, log_wandb
 
-
 def collect_real_interactions(
         num_interactions,
         obs,
@@ -59,7 +58,6 @@ def collect_real_interactions(
     return obs
 
 def train_world_model(
-        num_epochs,
         world_model,
         dataset,
         loader_cfg,
@@ -85,50 +83,49 @@ def train_world_model(
     global_loss_tracker = None
     num_total_batches = 0
 
-    for epoch_idx in range(num_epochs):
-        for batch in dataloader:
-            observations = batch['obs'].to(device, non_blocking=True).float()
-            actions = batch['action'].to(device, non_blocking=True).long()
-            rewards = batch['reward'].to(device, non_blocking=True).float()
-            dones = batch['done'].to(device, non_blocking=True).float()
+    for batch in dataloader:
+        observations = batch['obs'].to(device, non_blocking=True).float()
+        actions = batch['action'].to(device, non_blocking=True).long()
+        rewards = batch['reward'].to(device, non_blocking=True).float()
+        dones = batch['done'].to(device, non_blocking=True).float()
 
-            optimizer.zero_grad()
+        optimizer.zero_grad()
 
-            with torch.autocast(
-                device_type=device,
-                dtype=torch.bfloat16,
-                enabled=(trainer_cfg.precision == 'bf16-mixed')
-            ):
-                losses = world_model.loss(
-                    observations,
-                    actions,
-                    rewards,
-                    dones,
-                    loss_weights,
-                    history_size,
-                )
-                total_loss = losses['total_loss']
-            
-            total_loss.backward()
+        with torch.autocast(
+            device_type=device,
+            dtype=torch.bfloat16,
+            enabled=(trainer_cfg.precision == 'bf16-mixed')
+        ):
+            losses = world_model.loss(
+                observations,
+                actions,
+                rewards,
+                dones,
+                loss_weights,
+                history_size,
+            )
+            total_loss = losses['total_loss']
+        
+        total_loss.backward()
 
-            clip_val = trainer_cfg.gradient_clip_val
-            if clip_val is not None and clip_val > 0:
-                torch.nn.utils.clip_grad_norm_(world_model.parameters(), clip_val)
+        clip_val = trainer_cfg.gradient_clip_val
+        if clip_val is not None and clip_val > 0:
+            torch.nn.utils.clip_grad_norm_(world_model.parameters(), clip_val)
 
-            optimizer.step()
+        optimizer.step()
 
-            detached_losses = {
-                name: float(value.detach().clone().cpu())
-                for name, value in losses.items()
-            }
+        detached_losses = {
+            name: float(value.detach().clone().cpu())
+            for name, value in losses.items()
+        }
 
-            if global_loss_tracker is None:
-                global_loss_tracker = {name: 0.0 for name in detached_losses}
-            
-            for name, value in detached_losses.items():
-                global_loss_tracker[name] += value
-            
-            num_total_batches += 1
+        if global_loss_tracker is None:
+            global_loss_tracker = {name: 0.0 for name in detached_losses}
+        
+        for name, value in detached_losses.items():
+            global_loss_tracker[name] += value
+        
+        num_total_batches += 1
     
     return {
         name: value / num_total_batches
@@ -202,7 +199,7 @@ def eval_agent(
     
     return result
 
-@hydra.main(version_base=None, config_path='./config', config_name='config')
+@hydra.main(version_base=None, config_path='./config', config_name='dummy')
 def run(cfg):
     # Seeding
     random.seed(cfg.seed)
@@ -309,26 +306,26 @@ def run(cfg):
             )
 
             print("collection complete. size: ", replay_writer.size)
-
+        
+        # Training World Model
         wm_train_epochs = None
-        if cfg.wm_schedule.regular_start_epoch <= (epoch_idx+1) < cfg.wm_schedule.periodic_start_epoch:
+        if cfg.wm_schedule.start_epoch <= (epoch_idx+1) < cfg.wm_schedule.periodic_start_epoch:
             wm_train_epochs = cfg.wm_schedule.regular_epochs
         elif cfg.wm_schedule.periodic_start_epoch <= (epoch_idx+1) <= cfg.wm_schedule.stop_epoch and (epoch_idx+1) % cfg.wm_schedule.period == 0:
             wm_train_epochs = cfg.wm_schedule.periodic_epochs
         
-        # Training World Model
         if wm_train_epochs is not None:
-            wm_losses = train_world_model(
-                num_epochs=wm_train_epochs,
-                world_model=world_model,
-                dataset=dataset,
-                loader_cfg=cfg.loader,
-                trainer_cfg=cfg.trainer,
-                loss_weights=cfg.loss_weights,
-                history_size=cfg.history_size,
-                optimizer=wm_optimizer,
-                device=cfg.device,
-            )
+            for _ in range(wm_train_epochs):
+                wm_losses = train_world_model(
+                    world_model=world_model,
+                    dataset=dataset,
+                    loader_cfg=cfg.loader,
+                    trainer_cfg=cfg.trainer,
+                    loss_weights=cfg.loss_weights,
+                    history_size=cfg.history_size,
+                    optimizer=wm_optimizer,
+                    device=cfg.device,
+                )
 
             log_wandb(
                 wandb_run,
