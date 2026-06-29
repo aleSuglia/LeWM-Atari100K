@@ -9,6 +9,7 @@ import hydra
 from omegaconf import OmegaConf
 
 from lewm.imagination import ImaginationEnv
+from atari.env import AtariEnv
 from utils import build_optimizer, try_wandb_init, log_wandb
 
 def collect_real_interactions(
@@ -139,7 +140,6 @@ def eval_agent(
         world_model,
         env_cfg,
         device,
-        seed,
         at_end=False,
         eval_path=None,
 ):
@@ -150,10 +150,20 @@ def eval_agent(
     reward_history = []
     length_history = []
 
-    eval_env = hydra.utils.instantiate(env_cfg)
+    eval_env = AtariEnv(
+        game=env_cfg.game,
+        img_size=env_cfg.img_size,
+        processed_img_size=env_cfg.processed_img_size,
+        action_repeat=env_cfg.action_repeat,
+        noop_max=1,
+        repeat_action_probability=0.0,
+        terminal_on_life_loss=False,
+        grayscale_obs=False,
+        full_action_space=False
+    )
 
-    for ep_idx in range(episodes):
-        obs, _ = eval_env.reset(seed + ep_idx)
+    for _ in range(episodes):
+        obs, _ = eval_env.reset()
 
         done = False
         total_return  = 0.0
@@ -378,7 +388,6 @@ def run(cfg):
                 per_episode_limit=cfg.sanity_eval.per_episode_limit,
                 agent=agent,
                 world_model=world_model,
-                seed = cfg.seed,
                 env_cfg=cfg.env,
                 device=cfg.device,
                 at_end=False,
@@ -413,7 +422,6 @@ def run(cfg):
         per_episode_limit=cfg.eval.per_episode_limit,
         agent=agent,
         world_model=world_model,
-        seed = cfg.seed,
         env_cfg=cfg.env,
         device=cfg.device,
         at_end=True,
