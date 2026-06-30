@@ -3,7 +3,7 @@ defaults:
   - local: log
   - env: atari
   - model: lewm
-  - agent: ppo
+  - agent: agent
 
 seed: 0
 game: pong
@@ -60,29 +60,26 @@ collection_trainer:
   collection_per_epoch: 250
 
 wm_schedule:
-  steps_per_epoch: 256
+  steps_per_epoch: 128
   start_epoch: 10
   regular_epochs: 5
   periodic_start_epoch: 20
   period: 5
-  periodic_epochs: 20
+  periodic_epochs: 10
   stop_epoch: 470
 
 agent_trainer:
-  agent_start_epoch: 20
-  update_epochs: 4
-  total_steps: 1_000_000
+  agent_start_epoch: 30
+  total_steps: 500_000
 
-  gamma: 0.997
-  gae_lambda: 0.95
-  clip_coef: 0.2
-  ent_coef: 0.01
-  vf_coef: 0.5
-  max_grad_norm: 0.5
+  gamma: 0.995
+  lambda_: 0.95
+  entropy_weight: 0.002
+  max_grad_norm: 10.0
 
   optimizer:
     type: AdamW
-    lr: 3e-4
+    lr: 1e-4
     weight_decay: 0.0
 
 # -----------------------------------------------------------------------------

@@ -1,8 +1,0 @@
-_target_: agent.agent.PPOAgent
-
-embed_dim: ${embed_dim}
-hidden_dim: 512
-num_envs: 4096
-rollout_steps: 16
-num_actions: ???
-device: ${device}

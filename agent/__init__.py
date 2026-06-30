@@ -1,5 +1,5 @@
-from .agent import PPOAgent
+from .agent import Agent
 
 __all__ = [
-    "PPOAgent",
+    "Agent",
 ]

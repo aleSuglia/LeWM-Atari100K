@@ -1,0 +1,10 @@
+_target_: agent.agent.Agent
+
+embed_dim: ${embed_dim}
+hidden_dim: 512
+burn_in_length: 5
+num_envs: 2048
+imagination_horizon: 16
+num_actions: ???
+device: ${device}
+target_tau: 0.995
