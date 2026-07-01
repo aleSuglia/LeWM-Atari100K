@@ -1,15 +1,12 @@
-import json
 from pathlib import Path
+import hydra
+from omegaconf import OmegaConf
 
 import random
 import numpy as np
 import torch
 
-import hydra
-from omegaconf import OmegaConf
-
 from lewm.imagination import ImaginationEnv
-from atari.env import AtariEnv
 from utils import build_optimizer, try_wandb_init, log_wandb
 
 def collect_real_interactions(
@@ -145,8 +142,6 @@ def eval_agent(
         world_model,
         env_cfg,
         device,
-        at_end=False,
-        eval_path=None,
 ):
     """
     """
@@ -171,7 +166,7 @@ def eval_agent(
                 emb = world_model.encode(obs)
                 action = agent.predict(
                     emb,
-                    deterministic=True,    # Exploitation
+                    deterministic=True,
                 )
             
             obs, reward, terminated, truncated, _ = eval_env.step(int(action))
@@ -189,18 +184,9 @@ def eval_agent(
 
     eval_env.close()
     result = {
-        "episodes": episodes,
-        "ep_rewards": reward_history,
-        "ep_lengths": length_history,
         "mean_reward": np.mean(reward_history),
-        "std_reward": np.std(reward_history),
         "mean_length": np.mean(length_history)
     }
-
-    if at_end:
-        output_path = Path(eval_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(result, indent=2), encoding='utf-8')
     
     return result
 
@@ -392,13 +378,12 @@ def run(cfg):
                 world_model=world_model,
                 env_cfg=cfg.env,
                 device=cfg.device,
-                at_end=False,
             )
             log_wandb(
                 wandb_run,
                 {
-                    'sanity_eval/mean_rew': sanity_eval["mean_reward"],
-                    'sanity_eval/mean_len': sanity_eval['mean_length'],
+                    f"sanity_eval/{key}": value
+                    for key, value in sanity_eval.items()
                 },
                 epoch_idx
             )
@@ -414,21 +399,6 @@ def run(cfg):
     file_name = f"final.pt"
     agent_ckp_path = agent_ckp_dir / file_name
     torch.save(agent.state_dict(), agent_ckp_path)
-
-    #########################
-    ##     Evaluation      ##
-    #########################
-
-    eval_agent(
-        episodes=cfg.eval.episodes,
-        per_episode_limit=cfg.eval.per_episode_limit,
-        agent=agent,
-        world_model=world_model,
-        env_cfg=cfg.env,
-        device=cfg.device,
-        at_end=True,
-        eval_path=cfg.eval.output_path,
-    )
 
     atari_env.close()
     replay_writer.close()

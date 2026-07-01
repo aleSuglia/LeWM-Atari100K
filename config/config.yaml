@@ -87,8 +87,8 @@ agent_trainer:
 # Evaluation
 # -----------------------------------------------------------------------------
 eval:
-  episodes: 50
-  deterministic: true                                     # Not implemented
+  episodes: 100
+  deterministic: true
   per_episode_limit: 108_000
   output_path: ./eval/${game}.json
 
