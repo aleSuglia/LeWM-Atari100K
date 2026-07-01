@@ -2,9 +2,8 @@ _target_: agent.agent.Agent
 
 embed_dim: ${embed_dim}
 hidden_dim: 1024
-burn_in_length: 5
 num_envs: 2048
-imagination_horizon: 16
+rollout_steps: 16
+history_size: ${history_size}
 num_actions: ???
 device: ${device}
-target_tau: 0.995

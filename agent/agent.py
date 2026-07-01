@@ -1,17 +1,22 @@
+from __future__ import annotations
 from copy import deepcopy
+from dataclasses import dataclass
 
 import torch
 from torch import nn
 import torch.nn.functional as F
-
 from torch.distributions import Categorical
+
+@dataclass
+class ActorCriticOutput:
+    logits_actions: torch.FloatTensor
+    logits_values: torch.FloatTensor
 
 class ActorCritic(nn.Module):
     def __init__(self, embed_dim, num_actions, hidden_dim):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.hx, self.cx = None, None
-
         self.lstm = nn.LSTMCell(embed_dim, hidden_dim)
         self.actor_linear = nn.Linear(hidden_dim, num_actions)
         self.critic_linear = nn.Linear(hidden_dim, 1)
@@ -29,7 +34,12 @@ class ActorCritic(nn.Module):
     def clear(self):
         self.hx, self.cx = None, None
 
-    def forward(self, obs):
+    @torch.no_grad()
+    def burn_in(self, obs):
+        if obs.size(1) > 0:
+            _ = self(obs)
+
+    def forward(self, obs, **kwargs):
         if obs.ndim == 2:
             obs = obs.unsqueeze(1)
 
@@ -38,43 +48,36 @@ class ActorCritic(nn.Module):
         if self.hx is None or self.hx.size(0) != obs.size(0):
             self.reset(obs.size(0))
 
-        logits_actions = []
-        logits_values = []
+        all_logits_actions = []
+        all_logits_values = []
 
         for i in range(obs.size(1)):
             self.hx, self.cx = self.lstm(obs[:, i], (self.hx, self.cx))
-            logits_actions.append(self.actor_linear(self.hx))
-            logits_values.append(self.critic_linear(self.hx))
+            all_logits_actions.append(self.actor_linear(self.hx).unsqueeze(1))
+            all_logits_values.append(self.critic_linear(self.hx).unsqueeze(1))
 
-        return torch.stack(logits_actions, dim=1), torch.stack(logits_values, dim=1)
+        return ActorCriticOutput(
+            torch.cat(all_logits_actions, dim=1),
+            torch.cat(all_logits_values, dim=1),
+        )
 
-    @torch.no_grad()
-    def burn_in(self, obs):
-        _ = self(obs)
-
-def compute_mask_after_first_done(dones):
-    assert dones.ndim == 2
-    first_done_idx = torch.argmax(dones.long(), dim=1)
-    mask = torch.arange(dones.size(1), device=dones.device).unsqueeze(0) <= first_done_idx.unsqueeze(1)
-    return torch.logical_or(mask, dones.sum(dim=1, keepdim=True) == 0)
-
-@torch.no_grad()
-def compute_lambda_returns(rewards, values, dones, value_bootstrap, gamma, lambda_):
-    assert rewards.ndim == 2
-    assert rewards.size() == values.size() == dones.size()
-    assert value_bootstrap.ndim == 1 and value_bootstrap.size(0) == rewards.size(0)
-
-    lambda_returns = rewards + dones.logical_not() * gamma * (1 - lambda_) * torch.cat(
-        (values[:, 1:], value_bootstrap.unsqueeze(1)),
-        dim=1,
+def compute_lambda_returns(rewards, values, ends, value_bootstrap, gamma, lambda_):
+    lambda_returns = rewards + ends.logical_not() * gamma * (1 - lambda_) * torch.cat(
+        (values[:, 1:], value_bootstrap.unsqueeze(1)), dim=1
     )
     last = value_bootstrap
 
     for t in list(range(rewards.size(1)))[::-1]:
-        lambda_returns[:, t] += dones[:, t].logical_not() * gamma * lambda_ * last
+        lambda_returns[:, t] += ends[:, t].logical_not() * gamma * lambda_ * last
         last = lambda_returns[:, t]
 
     return lambda_returns
+
+def compute_mask_after_first_done(ends):
+    first_one_index = torch.argmax(ends.long(), dim=1)
+    mask = torch.arange(ends.size(1), device=ends.device).unsqueeze(0) <= first_one_index.unsqueeze(1)
+    mask = torch.logical_or(mask, ends.sum(dim=1, keepdim=True) == 0)
+    return mask
 
 class Agent(nn.Module):
     def __init__(
@@ -82,160 +85,139 @@ class Agent(nn.Module):
             embed_dim,
             hidden_dim,
             num_envs,
-            burn_in_length,
-            imagination_horizon,
             num_actions,
             device,
-            target_tau=0.995,
+            rollout_steps=None,
+            history_size=None,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.hidden_dim = hidden_dim
         self.num_envs = num_envs
-        self.burn_in_length = burn_in_length
-        self.imagination_horizon = imagination_horizon
-        self.num_actions = num_actions
-        self.target_tau = target_tau
+        self.rollout_steps = rollout_steps
+        self.history_size = history_size
 
         self.device = torch.device(device)
-        self.net = ActorCritic(self.embed_dim, self.num_actions, self.hidden_dim).to(self.device)
-        self.target_net = deepcopy(self.net).to(self.device)
-        self.target_net.requires_grad_(False)
+        self.model = ActorCritic(self.embed_dim, num_actions, self.hidden_dim).to(self.device)
+        self.target_model = deepcopy(self.model).to(self.device)
+        self.target_model.requires_grad_(False)
 
-    def reset(self, n):
-        self.net.reset(n)
-        self.target_net.reset(n)
+    @property
+    def net(self):
+        return self.model
+
+    def reset(self, n=1):
+        self.model.reset(n)
+        self.target_model.reset(n)
 
     def clear(self):
-        self.net.clear()
-        self.target_net.clear()
+        self.model.clear()
+        self.target_model.clear()
 
     def update_target(self):
-        source_state_dict = self.net.state_dict()
-        target_state_dict = self.target_net.state_dict()
-
+        source_state_dict = self.model.state_dict()
+        target_state_dict = self.target_model.state_dict()
+        TAU = 0.995
         for key in source_state_dict:
-            target_state_dict[key] = source_state_dict[key] * (1 - self.target_tau) + target_state_dict[key] * self.target_tau
-
-        self.target_net.load_state_dict(target_state_dict)
-
-    def _to_device(self, obs):
-        if not torch.is_tensor(obs):
-            obs = torch.as_tensor(obs)
-        return obs.to(self.device).float()
-
-    def _prepare_reset_obs(self, obs):
-        obs = self._to_device(obs)
-        if obs.ndim == 1:
-            obs = obs.unsqueeze(0)
-
-        self.reset(obs.size(0))
-
-        if obs.ndim == 3 and obs.size(1) > 1:
-            burn_in = obs[:, :-1]
-            self.net.burn_in(burn_in)
-            self.target_net.burn_in(burn_in)
-            obs = obs[:, -1]
-
-        return obs
+            target_state_dict[key] = source_state_dict[key] * (1 - TAU) + target_state_dict[key] * TAU
+        self.target_model.load_state_dict(target_state_dict)
 
     def step(self, obs, deterministic=False):
-        obs = self._to_device(obs)
-        logits_actions, logits_values = self.net(obs)
-        logits_actions = logits_actions[:, -1]
-        values = logits_values[:, -1, 0]
-
-        dist = Categorical(logits=logits_actions)
-        action = logits_actions.argmax(dim=-1) if deterministic else dist.sample()
+        obs = obs.to(self.device).float()
+        outputs = self.model(obs)
+        logits = outputs.logits_actions[:, -1]
+        value = outputs.logits_values[:, -1, 0]
+        dist = Categorical(logits=logits)
+        action = logits.argmax(dim=-1) if deterministic else dist.sample()
         logprob = dist.log_prob(action)
 
-        return action, logprob, values
+        return action, logprob, value
 
     @torch.no_grad()
     def predict(self, obs, deterministic=False):
-        # always recieves single obs
+        if obs.ndim == 1:
+            obs = obs.unsqueeze(0)
         action, _, _ = self.step(obs, deterministic)
-        return int(action.reshape(-1)[0].item())
+        return int(action.item())
 
     def imagine(self, imagination_env):
-        obs = self._prepare_reset_obs(imagination_env.reset(self.num_envs))
+        context = imagination_env.reset(self.num_envs).to(self.device).float()
+        obs = context[:, -1]
+
+        self.reset(n=self.num_envs)
+        self.model.burn_in(context[:, :-1])
+        self.target_model.burn_in(context[:, :-1])
 
         all_actions = []
         all_logits_actions = []
         all_logits_values = []
         all_target_values = []
         all_rewards = []
-        all_dones = []
+        all_ends = []
 
-        for _ in range(self.imagination_horizon):
-            logits_actions, logits_values = self.net(obs)
-            logits_actions = logits_actions[:, -1]
-            logits_values = logits_values[:, -1, 0]
-
-            dist = Categorical(logits=logits_actions)
-            action = dist.sample()
+        for _ in range(self.rollout_steps):
+            outputs = self.model(obs.unsqueeze(1))
+            logits_actions = outputs.logits_actions[:, -1]
+            action = Categorical(logits=logits_actions).sample()
 
             with torch.no_grad():
-                target_logits_values = self.target_net(obs)[1][:, -1, 0]
-                next_obs, reward, done, _ = imagination_env.step(action)
+                target_values = self.target_model(obs.unsqueeze(1)).logits_values[:, -1, 0]
 
-            all_actions.append(action)
-            all_logits_actions.append(logits_actions)
-            all_logits_values.append(logits_values)
-            all_target_values.append(target_logits_values)
-            all_rewards.append(self._to_device(reward).reshape(-1))
-            all_dones.append(self._to_device(done).reshape(-1).bool())
+            obs, reward, done, _ = imagination_env.step(action)
 
-            obs = self._to_device(next_obs)
+            all_actions.append(action.unsqueeze(1))
+            all_logits_actions.append(outputs.logits_actions)
+            all_logits_values.append(outputs.logits_values[:, :, 0])
+            all_target_values.append(target_values.unsqueeze(1))
+            all_rewards.append(reward.reshape(-1, 1))
+            all_ends.append(done.reshape(-1, 1))
 
         with torch.no_grad():
-            value_bootstrap = self.target_net(obs)[1][:, -1, 0]
-
-        self.clear()
+            value_bootstrap = self.target_model(obs.unsqueeze(1)).logits_values[:, -1, 0]
 
         return {
-            'actions': torch.stack(all_actions, dim=1),
-            'logits_actions': torch.stack(all_logits_actions, dim=1),
-            'logits_values': torch.stack(all_logits_values, dim=1),
-            'rewards': torch.stack(all_rewards, dim=1),
-            'dones': torch.stack(all_dones, dim=1),
-            'target_values': torch.stack(all_target_values, dim=1),
+            'actions': torch.cat(all_actions, dim=1),
+            'logits_actions': torch.cat(all_logits_actions, dim=1),
+            'logits_values': torch.cat(all_logits_values, dim=1),
+            'rewards': torch.cat(all_rewards, dim=1).to(self.device),
+            'ends': torch.cat(all_ends, dim=1).bool().to(self.device),
+            'target_values': torch.cat(all_target_values, dim=1),
             'value_bootstrap': value_bootstrap,
         }
 
-    def loss(self, imagination_env, trainer_cfg):
-        outputs = self.imagine(imagination_env)
+    def loss(self, rollout, trainer_cfg):
+        lambda_ = trainer_cfg.lambda_ if hasattr(trainer_cfg, 'lambda_') else trainer_cfg.gae_lambda
+        entropy_weight = trainer_cfg.entropy_weight if hasattr(trainer_cfg, 'entropy_weight') else trainer_cfg.ent_coef
 
         with torch.no_grad():
             lambda_returns = compute_lambda_returns(
-                rewards=outputs['rewards'],
-                values=outputs['target_values'],
-                dones=outputs['dones'],
-                value_bootstrap=outputs['value_bootstrap'],
+                rewards=rollout['rewards'],
+                values=rollout['target_values'],
+                ends=rollout['ends'],
+                value_bootstrap=rollout['value_bootstrap'],
                 gamma=trainer_cfg.gamma,
-                lambda_=trainer_cfg.lambda_,
+                lambda_=lambda_,
             )
 
-        dist = Categorical(logits=outputs['logits_actions'])
-        logprobs = dist.log_prob(outputs['actions'])
-        entropy = dist.entropy()
-        mask = compute_mask_after_first_done(outputs['dones'])
+        dist = Categorical(logits=rollout['logits_actions'])
+        log_probs = dist.log_prob(rollout['actions'])
+        mask = compute_mask_after_first_done(rollout['ends'])
 
-        advantages = lambda_returns[mask] - outputs['target_values'][mask]
-        loss_actions = torch.mean(-logprobs[mask] * advantages)
-        loss_values = F.mse_loss(outputs['logits_values'][mask], lambda_returns[mask])
-        policy_entropy = torch.mean(entropy[mask])
-        loss_entropy = -trainer_cfg.entropy_weight * policy_entropy
+        loss_actions = torch.mean(-log_probs[mask] * (lambda_returns[mask] - rollout['target_values'][mask]))
+        loss_values = F.mse_loss(rollout['logits_values'][mask], lambda_returns[mask])
+        entropy = torch.mean(dist.entropy()[mask])
+        loss_entropy = -entropy_weight * entropy
         loss = loss_actions + loss_values + loss_entropy
 
         self.update_target()
 
-        return loss, {
-            'loss_actions': loss_actions,
-            'loss_values': loss_values,
-            'loss_entropy': loss_entropy,
-            'policy_entropy': policy_entropy,
+        metrics = {
+            'loss': loss,
+            'policy_loss': loss_actions,
+            'value_loss': loss_values,
+            'entropy': entropy,
         }
+        return loss, metrics
 
     def learn(self, imagination_env, trainer_cfg, optimizer):
         self.train()
@@ -245,11 +227,15 @@ class Agent(nn.Module):
         steps_done = 0
 
         while steps_done < trainer_cfg.total_steps:
-            loss, metrics = self.loss(imagination_env, trainer_cfg)
+            rollout = self.imagine(imagination_env)
+            loss, metrics = self.loss(rollout, trainer_cfg)
+
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(self.parameters(), trainer_cfg.max_grad_norm)
             optimizer.step()
-            steps_done += self.num_envs * self.imagination_horizon
 
-        return {key: float(value.detach().cpu()) for key, value in metrics.items()}
+            self.clear()
+            steps_done += self.num_envs * self.rollout_steps
+
+        return {k: float(v.detach().cpu()) for k, v in metrics.items()}

@@ -49,7 +49,7 @@ class ImaginationEnv:
         if mask is None:
             self.elapsed = torch.zeros(batch_size, device=self.device)
             self.emb_history, self.emb_act_history = self._sample_context(batch_size)
-            return self.emb_history[:, -1]
+            return self.emb_history
         
         emb, act_emb = self._sample_context(int(mask.sum()))
         
@@ -57,7 +57,7 @@ class ImaginationEnv:
         self.emb_history[mask] = emb
         self.emb_act_history[mask] = act_emb
         
-        return self.emb_history[:, -1]
+        return self.emb_history
 
     @torch.no_grad()
     def step(self, action):
@@ -77,9 +77,5 @@ class ImaginationEnv:
         
         self.emb_history = torch.cat([self.emb_history, next_emb.unsqueeze(1)], dim=1)[:, -self.history_size:]
         self.emb_act_history = self.emb_act_history[:, -self.history_size + 1:]
-        
-        if done.any():
-            self.reset(mask=done)
-            next_emb = torch.where(done[:, None], self.emb_history[:, -1], next_emb)
         
         return next_emb, reward, done, {'terminated': terminated, 'truncated': truncated}

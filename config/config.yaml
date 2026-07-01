@@ -22,15 +22,15 @@ history_size: 6
 # -----------------------------------------------------------------------------
 loss_weights:
   pred_loss: 1
-  sigreg_loss: 0.3
-  rew_loss: 0.01
+  sigreg_loss: 0.25
+  rew_loss: 0.05
   don_loss: 0.01
 
 # -----------------------------------------------------------------------------
 # Imagination
 # -----------------------------------------------------------------------------
 imagination:
-  max_horizon: 70
+  max_horizon: 50
   history_size: ${history_size}
   done_threshold: 0.5
 
@@ -53,7 +53,7 @@ trainer:
 sanity_eval:
   every_x_epoch: 25
   episodes: 5
-  per_episode_limit: 10000
+  per_episode_limit: 5000
 
 collection_schedule:
   collection_limit: 100_200
@@ -63,15 +63,15 @@ collection_schedule:
 wm_schedule:
   steps_per_epoch: 256
   start_epoch: 15
-  regular_epochs: 3
+  regular_epochs: 2
   periodic_start_epoch: 50
   period: 5
-  periodic_epochs: 10
+  periodic_epochs: 8
   stop_epoch: 550
 
 agent_trainer:
   agent_start_epoch: 50
-  total_steps: 500_000
+  total_steps: 256_000
 
   gamma: 0.995
   lambda_: 0.95
@@ -109,7 +109,7 @@ loader:
   num_workers: 8
   pin_memory: true
   persistent_workers: true
-  prefetch_factor: 3
+  prefetch_factor: 2
 
 # -----------------------------------------------------------------------------
 # Replay storage
@@ -127,5 +127,5 @@ dataset:
   path: ${replay.path}
   batch_size: ${loader.batch_size}
   num_batches: ${wm_schedule.steps_per_epoch}
-  seq_len: 32
+  seq_len: 16
   allow_cross_episode: false
