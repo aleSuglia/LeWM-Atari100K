@@ -14,6 +14,7 @@ from utils import build_optimizer, try_wandb_init, log_wandb
 
 def collect_real_interactions(
         num_interactions,
+        is_random,
         obs,
         agent,
         world_model,
@@ -37,10 +38,14 @@ def collect_real_interactions(
 
         with torch.no_grad():
             emb = world_model.encode(obs)
-            action = agent.predict(
-                emb,
-                deterministic=False,    # Exploration
-            )
+            if not is_random:
+                action = agent.predict(
+                    emb,
+                    deterministic=False,
+                )
+            else:
+                num_actions = env.num_actions
+                action = random.randint(0, num_actions-1)
 
         next_obs, reward, terminated, truncated, _ = env.step(int(action))
 
@@ -150,17 +155,7 @@ def eval_agent(
     reward_history = []
     length_history = []
 
-    eval_env = AtariEnv(
-        game=env_cfg.game,
-        img_size=env_cfg.img_size,
-        processed_img_size=env_cfg.processed_img_size,
-        action_repeat=env_cfg.action_repeat,
-        noop_max=1,
-        repeat_action_probability=0.0,
-        terminal_on_life_loss=False,
-        grayscale_obs=False,
-        full_action_space=False
-    )
+    eval_env = hydra.utils.instantiate(env_cfg)
 
     for _ in range(episodes):
         obs, _ = eval_env.reset()
@@ -282,7 +277,7 @@ def run(cfg):
 
     # Tracking values
     total_collected_interactions = 0
-    collection_per_epoch = cfg.collection_trainer.collection_per_epoch
+    collection_per_epoch = cfg.collection_schedule.collection_per_epoch
 
     # Creating directories for checkpointing
     wm_ckp_dir = Path(cfg.checkpointing.wm_path)
@@ -294,13 +289,20 @@ def run(cfg):
     # Training Loop
     for epoch_idx in range(cfg.trainer.total_epochs):
         
-        print("running epoch: ", epoch_idx+1)
+        epoch_num = epoch_idx+1
+        print("running epoch: ", epoch_num)
 
         # Collection
-        if total_collected_interactions < cfg.collection_trainer.collection_limit:
+        if (epoch_num < cfg.collection_schedule.random_collection_epochs):
+            is_random = True
+        else:
+            is_random = False
+
+        if total_collected_interactions < cfg.collection_schedule.collection_limit:
             total_collected_interactions += collection_per_epoch  
             obs = collect_real_interactions(
                 num_interactions=collection_per_epoch,
+                is_random=is_random,
                 obs=obs,
                 agent=agent,
                 world_model=world_model,
@@ -319,9 +321,9 @@ def run(cfg):
         
         # Training World Model
         wm_train_epochs = None
-        if cfg.wm_schedule.start_epoch <= (epoch_idx+1) < cfg.wm_schedule.periodic_start_epoch:
+        if cfg.wm_schedule.start_epoch <= (epoch_num) < cfg.wm_schedule.periodic_start_epoch:
             wm_train_epochs = cfg.wm_schedule.regular_epochs
-        elif cfg.wm_schedule.periodic_start_epoch <= (epoch_idx+1) <= cfg.wm_schedule.stop_epoch and (epoch_idx+1) % cfg.wm_schedule.period == 0:
+        elif cfg.wm_schedule.periodic_start_epoch <= (epoch_num) <= cfg.wm_schedule.stop_epoch and (epoch_num) % cfg.wm_schedule.period == 0:
             wm_train_epochs = cfg.wm_schedule.periodic_epochs
         
         if wm_train_epochs is not None:
@@ -350,13 +352,13 @@ def run(cfg):
             print(wm_losses)
 
         # Checkpointing World Model
-        if((epoch_idx+1) % cfg.checkpointing.wm_per_epoch == 0):
-            file_name = f"epoch_{epoch_idx+1}.pt"
+        if((epoch_num) % cfg.checkpointing.wm_per_epoch == 0):
+            file_name = f"epoch_{epoch_num}.pt"
             wm_ckp_path = wm_ckp_dir / file_name
             torch.save(world_model.state_dict(), wm_ckp_path)
         
         # Training Agent
-        if(epoch_idx+1 >= cfg.agent_trainer.agent_start_epoch):
+        if(epoch_num >= cfg.agent_trainer.agent_start_epoch):
             agent_losses = agent.learn(
                 imagination_env,
                 cfg.agent_trainer,
@@ -376,8 +378,8 @@ def run(cfg):
             print(agent_losses)
 
         # Checkpointing Agent
-        if((epoch_idx+1) % cfg.checkpointing.agent_per_epoch == 0):
-            file_name = f"epoch_{epoch_idx+1}.pt"
+        if((epoch_num) % cfg.checkpointing.agent_per_epoch == 0):
+            file_name = f"epoch_{epoch_num}.pt"
             agent_ckp_path = agent_ckp_dir / file_name
             torch.save(agent.state_dict(), agent_ckp_path)
 
