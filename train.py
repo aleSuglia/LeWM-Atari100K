@@ -6,6 +6,7 @@ import random
 import numpy as np
 import torch
 
+import stable_pretraining
 from lewm.imagination import ImaginationEnv
 from utils import build_optimizer, try_wandb_init, log_wandb
 
