@@ -54,8 +54,9 @@ def run(cfg):
     reward_history = []
     length_history = []
 
-    for _ in range(cfg.eval.episodes):
-        obs, _ = atari_env.reset()
+    for ep_num in range(cfg.eval.episodes):
+        obs, _ = atari_env.reset(seed=cfg.seed + ep_num)
+        _ = agent.reset(1)
 
         done = False
         total_return = 0.0
@@ -66,6 +67,7 @@ def run(cfg):
 
             with torch.no_grad():
                 emb = world_model.encode(obs)
+                emb = emb.squeeze(1)
                 action, _ = agent.act(
                     emb,
                     deterministic=cfg.eval.deterministic,

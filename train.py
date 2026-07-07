@@ -5,7 +5,6 @@ from omegaconf import OmegaConf
 import random
 import numpy as np
 import torch
-import torch.nn as nn
 
 import stable_pretraining
 from lewm.imagination import ImaginationEnv
@@ -26,18 +25,13 @@ def collect_real_interactions(
     """
     collect given number of real interactions
     """
-    print(memory)
     agent.eval()
     world_model.eval()
     
     needs_reset = False
     agent.set_memory(memory)
 
-    for _ in range(num_interactions):
-        if needs_reset:
-            obs, _ = env.reset()
-            memory = agent.reset(1)
-        
+    for _ in range(num_interactions):        
         obs = torch.from_numpy(obs).unsqueeze(0).unsqueeze(0).to(device)
 
         with torch.no_grad():
@@ -63,7 +57,11 @@ def collect_real_interactions(
         )
 
         obs = next_obs
+        
         needs_reset = terminated or truncated
+        if needs_reset:
+            obs, _ = env.reset()
+            memory = agent.reset(1)
 
     writer.flush()
     agent.clear()

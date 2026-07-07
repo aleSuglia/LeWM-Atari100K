@@ -13,7 +13,7 @@ device: cuda
 # Shared model/data dimensions
 # -----------------------------------------------------------------------------
 
-img_size: 128
+img_size: 64
 embed_dim: 1024
 history_size: 5
 
@@ -75,8 +75,9 @@ agent_trainer:
 
   gamma: 0.995
   lambda_: 0.95
-  entropy_weight: 0.002
-  max_grad_norm: 10.0
+  weight_value_loss: 1.0
+  weight_entropy_loss: 0.001
+  gradient_clip_val: 10.0
 
   optimizer:
     type: AdamW
@@ -105,7 +106,7 @@ checkpointing:
 # DataLoader
 # -----------------------------------------------------------------------------
 loader:
-  batch_size: 32
+  batch_size: 64
   num_workers: 8
   pin_memory: true
   persistent_workers: true
