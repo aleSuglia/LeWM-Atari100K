@@ -5,16 +5,19 @@ from omegaconf import OmegaConf
 import random
 import numpy as np
 import torch
+import torch.nn as nn
 
 import stable_pretraining
 from lewm.imagination import ImaginationEnv
 from utils import build_optimizer, try_wandb_init, log_wandb
 
+@torch.no_grad()
 def collect_real_interactions(
         num_interactions,
         is_random,
         obs,
         agent,
+        memory,
         world_model,
         env,
         writer,
@@ -23,21 +26,25 @@ def collect_real_interactions(
     """
     collect given number of real interactions
     """
+    print(memory)
     agent.eval()
     world_model.eval()
     
     needs_reset = False
+    agent.set_memory(memory)
 
     for _ in range(num_interactions):
         if needs_reset:
             obs, _ = env.reset()
+            memory = agent.reset(1)
         
         obs = torch.from_numpy(obs).unsqueeze(0).unsqueeze(0).to(device)
 
         with torch.no_grad():
             emb = world_model.encode(obs)
+            emb = emb.squeeze(1)
             if not is_random:
-                action = agent.predict(
+                action, memory = agent.act(
                     emb,
                     deterministic=False,
                 )
@@ -59,7 +66,9 @@ def collect_real_interactions(
         needs_reset = terminated or truncated
 
     writer.flush()
-    return obs
+    agent.clear()
+    
+    return obs, memory
 
 def train_world_model(
         world_model,
@@ -136,6 +145,55 @@ def train_world_model(
         for name, value in global_loss_tracker.items()
     }
 
+def train_agent(
+        agent,
+        optimizer,
+        trainer_cfg,
+        imagination_env
+):
+    """
+    """
+    agent.train()
+    imagination_env.world_model.eval()
+
+    metric_tracker = None
+    num_steps = 0
+
+    for _ in range(trainer_cfg.steps_per_epoch):
+        rollout = agent.imagine(imagination_env)
+        loss, metrics = agent.loss(rollout, trainer_cfg)
+
+        optimizer.zero_grad()
+        loss.backward()
+
+        clip_val = trainer_cfg.gradient_clip_val
+        if clip_val is not None and clip_val > 0:
+            torch.nn.utils.clip_grad_norm_(agent.parameters(), clip_val)
+        
+        optimizer.step()
+        agent.clear()
+
+        detached_metrics = {
+            name: float(value.detach().cpu())
+            for name, value in metrics.items()
+        }
+
+        if metric_tracker is None:
+            metric_tracker = {
+                name: 0.0 for name in detached_metrics
+            }
+
+        for name, value in detached_metrics.items():
+            metric_tracker[name] += value
+
+        num_steps += 1
+
+    agent.clear()
+    return {
+        name: value / num_steps
+        for name, value in metric_tracker.items()
+    }
+
 def eval_agent(
         episodes,
         per_episode_limit,
@@ -147,6 +205,7 @@ def eval_agent(
     """
     """
     world_model.eval()
+    agent.eval()
 
     reward_history = []
     length_history = []
@@ -154,6 +213,7 @@ def eval_agent(
     eval_env = hydra.utils.instantiate(env_cfg)
 
     for _ in range(episodes):
+        _ = agent.reset(1)
         obs, _ = eval_env.reset()
 
         done = False
@@ -165,7 +225,8 @@ def eval_agent(
 
             with torch.no_grad():
                 emb = world_model.encode(obs)
-                action = agent.predict(
+                emb = emb.squeeze(1)
+                action, _ = agent.act(
                     emb,
                     deterministic=True,
                 )
@@ -183,6 +244,7 @@ def eval_agent(
         reward_history.append(total_return)
         length_history.append(length)
 
+    agent.clear()
     eval_env.close()
     result = {
         "mean_reward": np.mean(reward_history),
@@ -191,7 +253,7 @@ def eval_agent(
     
     return result
 
-@hydra.main(version_base=None, config_path='./config', config_name='dummy')
+@hydra.main(version_base=None, config_path='./config', config_name='config')
 def run(cfg):
     # Seeding
     random.seed(cfg.seed)
@@ -249,10 +311,13 @@ def run(cfg):
     ##      Training       ##
     #########################
 
-    # Initial observation
+    # Initial Observation
     obs, _ = atari_env.reset(seed=cfg.seed)
 
-    # World Model optimizer
+    # Agent Setup
+    memory = agent.reset(1)
+
+    # Optimizer
     wm_optimizer = build_optimizer(
         world_model.parameters(),
         cfg.trainer.optimizer,
@@ -287,11 +352,12 @@ def run(cfg):
 
         if total_collected_interactions < cfg.collection_schedule.collection_limit:
             total_collected_interactions += collection_per_epoch  
-            obs = collect_real_interactions(
+            obs, memory = collect_real_interactions(
                 num_interactions=collection_per_epoch,
                 is_random=is_random,
                 obs=obs,
                 agent=agent,
+                memory=memory,
                 world_model=world_model,
                 env=atari_env,
                 writer=replay_writer,
@@ -346,10 +412,11 @@ def run(cfg):
         
         # Training Agent
         if(epoch_num >= cfg.agent_trainer.agent_start_epoch):
-            agent_losses = agent.learn(
-                imagination_env,
-                cfg.agent_trainer,
-                agent_optimizer
+            agent_losses = train_agent(
+                agent=agent,
+                optimizer=agent_optimizer,
+                trainer_cfg=cfg.agent_trainer,
+                imagination_env=imagination_env,
             )
 
             log_wandb(

@@ -14,16 +14,16 @@ device: cuda
 # -----------------------------------------------------------------------------
 
 img_size: 128
-embed_dim: 512
-history_size: 6
+embed_dim: 1024
+history_size: 5
 
 # -----------------------------------------------------------------------------
 # Loss weighting
 # -----------------------------------------------------------------------------
 loss_weights:
   pred_loss: 1
-  sigreg_loss: 0.25
-  rew_loss: 0.05
+  sigreg_loss: 0.3
+  rew_loss: 0.03
   don_loss: 0.01
 
 # -----------------------------------------------------------------------------
@@ -63,15 +63,15 @@ collection_schedule:
 wm_schedule:
   steps_per_epoch: 256
   start_epoch: 15
-  regular_epochs: 2
-  periodic_start_epoch: 50
+  regular_epochs: 1
+  periodic_start_epoch: 60
   period: 5
-  periodic_epochs: 8
-  stop_epoch: 550
+  periodic_epochs: 5
+  stop_epoch: 530
 
 agent_trainer:
-  agent_start_epoch: 50
-  total_steps: 256_000
+  agent_start_epoch: 60
+  steps_per_epoch: 200
 
   gamma: 0.995
   lambda_: 0.95
@@ -105,7 +105,7 @@ checkpointing:
 # DataLoader
 # -----------------------------------------------------------------------------
 loader:
-  batch_size: 64
+  batch_size: 32
   num_workers: 8
   pin_memory: true
   persistent_workers: true
@@ -127,5 +127,5 @@ dataset:
   path: ${replay.path}
   batch_size: ${loader.batch_size}
   num_batches: ${wm_schedule.steps_per_epoch}
-  seq_len: 16
+  seq_len: 32
   allow_cross_episode: false

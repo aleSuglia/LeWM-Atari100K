@@ -10,11 +10,8 @@ encoder:
   
   # Additions
   hidden_size: ${embed_dim}
-  # hidden_size % num_attention_heads = integer
-    # for small, attention_heads = 6
-  num_attention_heads: 8
-  # 4 x hidden_size
-  intermediate_size: 2048
+  num_attention_heads: 8                              # hidden_size % num_attention_heads = integer (for small, attention_heads = 6)
+  intermediate_size: ${eval:${embed_dim} * 4}         # 4 x hidden_size
 
 predictor:
   _target_: lewm.modules.ARPredictor

@@ -6,9 +6,9 @@ from omegaconf import OmegaConf
 import numpy as np
 import torch
 
-import stable_pretraining as spt
+import stable_pretraining
 
-@hydra.main(version_base=None, config_path='./config', config_name='dummy')
+@hydra.main(version_base=None, config_path='./config', config_name='config')
 def run(cfg):
     # Env
     atari_env = hydra.utils.instantiate(cfg.env)
@@ -66,7 +66,7 @@ def run(cfg):
 
             with torch.no_grad():
                 emb = world_model.encode(obs)
-                action = agent.predict(
+                action, _ = agent.act(
                     emb,
                     deterministic=cfg.eval.deterministic,
                 )

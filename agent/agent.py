@@ -1,241 +1,314 @@
-from __future__ import annotations
-from copy import deepcopy
-from dataclasses import dataclass
-
 import torch
-from torch import nn
-import torch.nn.functional as F
+import torch.nn as nn
 from torch.distributions import Categorical
+import torch.nn.functional as F
 
-@dataclass
-class ActorCriticOutput:
-    logits_actions: torch.FloatTensor
-    logits_values: torch.FloatTensor
 
-class ActorCritic(nn.Module):
-    def __init__(self, embed_dim, num_actions, hidden_dim):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.hx, self.cx = None, None
-        self.lstm = nn.LSTMCell(embed_dim, hidden_dim)
-        self.actor_linear = nn.Linear(hidden_dim, num_actions)
-        self.critic_linear = nn.Linear(hidden_dim, 1)
-        self.critic_linear.weight.data.zero_()
-        self.critic_linear.bias.data.zero_()
+def init_lstm(model: nn.Module) -> None:
+    for name, p in model.named_parameters():
+        if "weight_ih" in name:
+            nn.init.xavier_uniform_(p.data)
+        elif "weight_hh" in name:
+            nn.init.orthogonal_(p.data)
+        elif "bias_ih" in name:
+            p.data.fill_(0)
+            # Set forget-gate bias to 1
+            n = p.size(0)
+            p.data[(n // 4) : (n // 2)].fill_(1)
+        elif "bias_hh" in name:
+            p.data.fill_(0)
 
-    @property
-    def device(self):
-        return self.lstm.weight_hh.device
 
-    def reset(self, n):
-        self.hx = torch.zeros(n, self.hidden_dim, device=self.device)
-        self.cx = torch.zeros(n, self.hidden_dim, device=self.device)
+@torch.no_grad()
+def compute_lambda_returns(
+    rew,
+    end,
+    trunc,
+    val_bootstrap,
+    gamma,
+    lambda_,
+):
+    assert rew.ndim == 2 and rew.size() == end.size() == trunc.size() == val_bootstrap.size()
 
-    def clear(self):
-        self.hx, self.cx = None, None
+    rew = rew.sign()  # clip reward
 
-    @torch.no_grad()
-    def burn_in(self, obs):
-        if obs.size(1) > 0:
-            _ = self(obs)
+    end = end.float()
+    trunc = trunc.float()
 
-    def forward(self, obs, **kwargs):
-        if obs.ndim == 2:
-            obs = obs.unsqueeze(1)
+    end_or_trunc = (end + trunc).clip(max=1)
+    not_end = 1 - end
+    not_trunc = 1 - trunc
 
-        assert obs.ndim == 3
+    lambda_returns = rew + not_end * gamma * (not_trunc * (1 - lambda_) + trunc) * val_bootstrap
 
-        if self.hx is None or self.hx.size(0) != obs.size(0):
-            self.reset(obs.size(0))
+    if lambda_ == 0:
+        return lambda_returns
 
-        all_logits_actions = []
-        all_logits_values = []
-
-        for i in range(obs.size(1)):
-            self.hx, self.cx = self.lstm(obs[:, i], (self.hx, self.cx))
-            all_logits_actions.append(self.actor_linear(self.hx).unsqueeze(1))
-            all_logits_values.append(self.critic_linear(self.hx).unsqueeze(1))
-
-        return ActorCriticOutput(
-            torch.cat(all_logits_actions, dim=1),
-            torch.cat(all_logits_values, dim=1),
-        )
-
-def compute_lambda_returns(rewards, values, ends, value_bootstrap, gamma, lambda_):
-    lambda_returns = rewards + ends.logical_not() * gamma * (1 - lambda_) * torch.cat(
-        (values[:, 1:], value_bootstrap.unsqueeze(1)), dim=1
-    )
-    last = value_bootstrap
-
-    for t in list(range(rewards.size(1)))[::-1]:
-        lambda_returns[:, t] += ends[:, t].logical_not() * gamma * lambda_ * last
+    last = val_bootstrap[:, -1]
+    for t in reversed(range(rew.size(1))):
+        lambda_returns[:, t] += end_or_trunc[:, t].logical_not() * gamma * lambda_ * last
         last = lambda_returns[:, t]
 
     return lambda_returns
 
-def compute_mask_after_first_done(ends):
-    first_one_index = torch.argmax(ends.long(), dim=1)
-    mask = torch.arange(ends.size(1), device=ends.device).unsqueeze(0) <= first_one_index.unsqueeze(1)
-    mask = torch.logical_or(mask, ends.sum(dim=1, keepdim=True) == 0)
-    return mask
 
-class Agent(nn.Module):
+class ActorCritic(nn.Module):
+    """
+    Recurrent actor-critic that receives latent states directly.
+
+    Input:
+        obs: (b, z)
+
+    Output:
+        act_logit: (b, num_actions)
+        val:       (b,)
+    """
+
     def __init__(
-            self,
-            embed_dim,
-            hidden_dim,
-            num_envs,
-            num_actions,
-            device,
-            rollout_steps=None,
-            history_size=None,
+        self,
+        input_dim,
+        hidden_dim,
+        num_actions,
     ):
         super().__init__()
-        self.embed_dim = embed_dim
+
+        self.hidden_dim = hidden_dim
+
+        self.lstm = nn.LSTMCell(input_dim, hidden_dim)
+        self.critic_linear = nn.Linear(hidden_dim, 1)
+        self.actor_linear = nn.Linear(hidden_dim, num_actions)
+
+        self.actor_linear.weight.data.fill_(0)
+        self.actor_linear.bias.data.fill_(0)
+        self.critic_linear.weight.data.fill_(0)
+        self.critic_linear.bias.data.fill_(0)
+        init_lstm(self.lstm)
+
+        self.hx = None
+        self.cx = None
+
+    @property
+    def device(self) -> torch.device:
+        return self.lstm.weight_hh.device
+
+    @torch.no_grad()
+    def burn_in(self, context):                 # (b, t, z)
+        assert self.hx is not None
+        assert self.cx is not None
+        assert context.ndim == 3
+
+        context = context.to(self.device)
+        for t in range(context.size(1)):
+            self.hx, self.cx = self.lstm(context[:, t], (self.hx, self.cx))
+
+    def predict_act_value(self, obs):            # (b, z)
+        assert self.hx is not None
+        assert self.cx is not None
+        assert obs.ndim == 1 or obs.ndim == 2
+
+        obs = obs.to(self.device)
+
+        self.hx, self.cx = self.lstm(obs, (self.hx, self.cx))
+        act_logit = self.actor_linear(self.hx)
+        val = self.critic_linear(self.hx).squeeze(dim=1)
+
+        return act_logit, val, (self.hx, self.cx)
+
+class Agent(nn.Module):
+    """
+    """
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim,
+        num_envs,
+        num_actions,
+        rollout_steps,
+        burn_in_len,
+        device,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_envs = num_envs
         self.rollout_steps = rollout_steps
-        self.history_size = history_size
+        self.burn_in_len = burn_in_len
 
         self.device = torch.device(device)
-        self.model = ActorCritic(self.embed_dim, num_actions, self.hidden_dim).to(self.device)
-        self.target_model = deepcopy(self.model).to(self.device)
-        self.target_model.requires_grad_(False)
+        self.model = ActorCritic(
+            self.input_dim,
+            self.hidden_dim,
+            num_actions,
+        ).to(self.device)
 
-    @property
-    def net(self):
-        return self.model
+    def set_memory(self, hx_cx):
+        """
+        """
+        self.model.hx = hx_cx[0]
+        self.model.cx = hx_cx[1]
 
-    def reset(self, n=1):
-        self.model.reset(n)
-        self.target_model.reset(n)
+    def reset(self, n):
+        """
+        """
+        self.model.hx = torch.zeros(n, self.hidden_dim, device=self.device)
+        self.model.cx = torch.zeros(n, self.hidden_dim, device=self.device)
+        return (self.model.hx, self.model.cx)
 
     def clear(self):
-        self.model.clear()
-        self.target_model.clear()
-
-    def update_target(self):
-        source_state_dict = self.model.state_dict()
-        target_state_dict = self.target_model.state_dict()
-        TAU = 0.995
-        for key in source_state_dict:
-            target_state_dict[key] = source_state_dict[key] * (1 - TAU) + target_state_dict[key] * TAU
-        self.target_model.load_state_dict(target_state_dict)
-
-    def step(self, obs, deterministic=False):
-        obs = obs.to(self.device).float()
-        outputs = self.model(obs)
-        logits = outputs.logits_actions[:, -1]
-        value = outputs.logits_values[:, -1, 0]
-        dist = Categorical(logits=logits)
-        action = logits.argmax(dim=-1) if deterministic else dist.sample()
-        logprob = dist.log_prob(action)
-
-        return action, logprob, value
+        self.model.hx = None
+        self.model.cx = None
 
     @torch.no_grad()
-    def predict(self, obs, deterministic=False):
+    def burn_in(self, context):
+        """
+        """
+        self.model.burn_in(context)
+        return (self.model.hx, self.model.cx)
+    
+    @torch.no_grad()
+    def act(self, obs, deterministic):
+        """
+        """
         if obs.ndim == 1:
             obs = obs.unsqueeze(0)
-        action, _, _ = self.step(obs, deterministic)
-        return int(action.item())
+        
+        act_logit, _, hx_cx = self.model.predict_act_value(obs)
+        if deterministic:
+            action = torch.argmax(act_logit, dim=-1)
+        else:
+            action = Categorical(logits=act_logit).sample()
+        
+        return int(action.item()), hx_cx
 
     def imagine(self, imagination_env):
-        context = imagination_env.reset(self.num_envs).to(self.device).float()
-        obs = context[:, -1]
+        """
+        Collects one imagined rollout.
 
-        self.reset(n=self.num_envs)
-        self.model.burn_in(context[:, :-1])
-        self.target_model.burn_in(context[:, :-1])
+        The imagination environment does not reset internally after
+        termination/truncation. Therefore, a mask is created so that
+        the loss ignores all steps after the first dead step.
+        """
+        with torch.no_grad():
+            context = imagination_env.reset(self.num_envs)              # (b, t, z)
+
+        context = context.to(self.device)
+        obs = context[:, -1]                                            # (b, z)
+
+        self.reset(self.num_envs)
+
+        burn_in_context = context[:, -self.burn_in_len - 1 : -1]            # (b, t, z)
+        _ = self.burn_in(burn_in_context)
 
         all_actions = []
-        all_logits_actions = []
-        all_logits_values = []
-        all_target_values = []
         all_rewards = []
-        all_ends = []
+        all_truncated = []
+        all_terminated = []
+        all_act_logits = []
+        all_vals = []
+        all_val_bootstraps = []
+        all_masks = []
 
-        for _ in range(self.rollout_steps):
-            outputs = self.model(obs.unsqueeze(1))
-            logits_actions = outputs.logits_actions[:, -1]
-            action = Categorical(logits=logits_actions).sample()
+        alive = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+
+        for step in range(self.rollout_steps):
+            act_logit, val, _ = self.model.predict_act_value(obs)
+
+            if step > 0:
+                all_val_bootstraps[-1] = val.detach().clone()
+
+            action = Categorical(logits=act_logit).sample()
 
             with torch.no_grad():
-                target_values = self.target_model(obs.unsqueeze(1)).logits_values[:, -1, 0]
+                obs, rew, terminated, truncated, info = imagination_env.step(action)
 
-            obs, reward, done, _ = imagination_env.step(action)
+            obs = obs.to(self.device)
+            rew = rew.to(self.device)
+            terminated = terminated.to(self.device).bool()
+            truncated = truncated.to(self.device).bool()
 
-            all_actions.append(action.unsqueeze(1))
-            all_logits_actions.append(outputs.logits_actions)
-            all_logits_values.append(outputs.logits_values[:, :, 0])
-            all_target_values.append(target_values.unsqueeze(1))
-            all_rewards.append(reward.reshape(-1, 1))
-            all_ends.append(done.reshape(-1, 1))
+            mask = alive.float()
+            dead = torch.logical_or(terminated, truncated)
+            alive = torch.logical_and(alive, torch.logical_not(dead))
+
+            all_actions.append(action)
+            all_rewards.append(rew)
+            all_truncated.append(truncated)
+            all_terminated.append(terminated)
+            all_act_logits.append(act_logit)
+            all_vals.append(val)
+            all_val_bootstraps.append(None)
+            all_masks.append(mask)
 
         with torch.no_grad():
-            value_bootstrap = self.target_model(obs.unsqueeze(1)).logits_values[:, -1, 0]
+            hx, cx = self.model.hx, self.model.cx
+            _, val_bootstrap, _ = self.model.predict_act_value(obs)
+            self.model.hx, self.model.cx = hx, cx
+
+        all_val_bootstraps[-1] = val_bootstrap.detach().clone()
 
         return {
-            'actions': torch.cat(all_actions, dim=1),
-            'logits_actions': torch.cat(all_logits_actions, dim=1),
-            'logits_values': torch.cat(all_logits_values, dim=1),
-            'rewards': torch.cat(all_rewards, dim=1).to(self.device),
-            'ends': torch.cat(all_ends, dim=1).bool().to(self.device),
-            'target_values': torch.cat(all_target_values, dim=1),
-            'value_bootstrap': value_bootstrap,
+            "actions": torch.stack(all_actions, dim=1),
+            "rewards": torch.stack(all_rewards, dim=1),
+            "truncated": torch.stack(all_truncated, dim=1),
+            "terminated": torch.stack(all_terminated, dim=1),
+            "act_logits": torch.stack(all_act_logits, dim=1),
+            "vals": torch.stack(all_vals, dim=1),
+            "val_bootstraps": torch.stack(all_val_bootstraps, dim=1),
+            "mask": torch.stack(all_masks, dim=1),
         }
 
-    def loss(self, rollout, trainer_cfg):
-        lambda_ = trainer_cfg.lambda_ if hasattr(trainer_cfg, 'lambda_') else trainer_cfg.gae_lambda
-        entropy_weight = trainer_cfg.entropy_weight if hasattr(trainer_cfg, 'entropy_weight') else trainer_cfg.ent_coef
+    def loss(
+        self,
+        rollout,
+        cfg,
+    ):
+        gamma = cfg.gamma
+        lambda_ = cfg.lambda_
 
-        with torch.no_grad():
-            lambda_returns = compute_lambda_returns(
-                rewards=rollout['rewards'],
-                values=rollout['target_values'],
-                ends=rollout['ends'],
-                value_bootstrap=rollout['value_bootstrap'],
-                gamma=trainer_cfg.gamma,
-                lambda_=lambda_,
-            )
+        actions = rollout["actions"]
+        rewards = rollout["rewards"]
+        truncated = rollout["truncated"]
+        terminated = rollout["terminated"]
+        act_logits = rollout["act_logits"]
+        vals = rollout["vals"]
+        val_bootstraps = rollout["val_bootstraps"]
+        mask = rollout["mask"].float()
 
-        dist = Categorical(logits=rollout['logits_actions'])
-        log_probs = dist.log_prob(rollout['actions'])
-        mask = compute_mask_after_first_done(rollout['ends'])
+        dist = Categorical(logits=act_logits)
 
-        loss_actions = torch.mean(-log_probs[mask] * (lambda_returns[mask] - rollout['target_values'][mask]))
-        loss_values = F.mse_loss(rollout['logits_values'][mask], lambda_returns[mask])
-        entropy = torch.mean(dist.entropy()[mask])
-        loss_entropy = -entropy_weight * entropy
-        loss = loss_actions + loss_values + loss_entropy
+        lambda_returns = compute_lambda_returns(
+            rewards,
+            terminated,
+            truncated,
+            val_bootstraps,
+            gamma,
+            lambda_,
+        )
 
-        self.update_target()
+        advantage = lambda_returns - vals
+
+        valid_count = mask.sum().clamp_min(1.0)
+
+        log_prob = dist.log_prob(actions)
+        entropy = dist.entropy()
+
+        loss_actions = (-(log_prob * advantage.detach()) * mask).sum() / valid_count
+
+        loss_values = ((vals - lambda_returns.detach()).pow(2) * mask).sum() / valid_count
+        loss_values = cfg.weight_value_loss * loss_values
+
+        entropy = (entropy * mask).sum() / valid_count
+        loss_entropy = -cfg.weight_entropy_loss * entropy
+
+        loss_total = loss_actions + loss_values + loss_entropy
 
         metrics = {
-            'loss': loss,
-            'policy_loss': loss_actions,
-            'value_loss': loss_values,
-            'entropy': entropy,
+            "loss_total": loss_total.detach(),
+            "loss_actions": loss_actions.detach(),
+            "loss_values": loss_values.detach(),
+            "loss_entropy": loss_entropy.detach(),
+            "policy_entropy": entropy.detach(),
+            "valid_steps": valid_count.detach(),
         }
-        return loss, metrics
 
-    def learn(self, imagination_env, trainer_cfg, optimizer):
-        self.train()
-        imagination_env.world_model.eval()
-
-        metrics = {}
-        steps_done = 0
-
-        while steps_done < trainer_cfg.total_steps:
-            rollout = self.imagine(imagination_env)
-            loss, metrics = self.loss(rollout, trainer_cfg)
-
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.parameters(), trainer_cfg.max_grad_norm)
-            optimizer.step()
-
-            self.clear()
-            steps_done += self.num_envs * self.rollout_steps
-
-        return {k: float(v.detach().cpu()) for k, v in metrics.items()}
+        return loss_total, metrics

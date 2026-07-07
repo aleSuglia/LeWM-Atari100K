@@ -1,9 +1,9 @@
 _target_: agent.agent.Agent
 
-embed_dim: ${embed_dim}
-hidden_dim: 1024
-num_envs: 2048
-rollout_steps: 16
-history_size: ${history_size}
+input_dim: ${embed_dim}
+hidden_dim: 512
+num_envs: 64
+rollout_steps: 20
+burn_in_len: 3
 num_actions: ???
 device: ${device}

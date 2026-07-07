@@ -45,18 +45,9 @@ class ImaginationEnv:
         return emb, act_emb[:, :-1]
 
     @torch.no_grad()
-    def reset(self, batch_size=None, mask=None):
-        if mask is None:
-            self.elapsed = torch.zeros(batch_size, device=self.device)
-            self.emb_history, self.emb_act_history = self._sample_context(batch_size)
-            return self.emb_history
-        
-        emb, act_emb = self._sample_context(int(mask.sum()))
-        
-        self.elapsed[mask] = 0
-        self.emb_history[mask] = emb
-        self.emb_act_history[mask] = act_emb
-        
+    def reset(self, batch_size=None):
+        self.elapsed = torch.zeros(batch_size, device=self.device)
+        self.emb_history, self.emb_act_history = self._sample_context(batch_size)
         return self.emb_history
 
     @torch.no_grad()
@@ -78,4 +69,4 @@ class ImaginationEnv:
         self.emb_history = torch.cat([self.emb_history, next_emb.unsqueeze(1)], dim=1)[:, -self.history_size:]
         self.emb_act_history = self.emb_act_history[:, -self.history_size + 1:]
         
-        return next_emb, reward, done, {'terminated': terminated, 'truncated': truncated}
+        return next_emb, reward, terminated, truncated, {'done': done}
