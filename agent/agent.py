@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 from torch.distributions import Categorical
-import torch.nn.functional as F
 
 
 def init_lstm(model: nn.Module) -> None:
@@ -28,7 +27,10 @@ def compute_lambda_returns(
     gamma,
     lambda_,
 ):
-    assert rew.ndim == 2 and rew.size() == end.size() == trunc.size() == val_bootstrap.size()
+    assert (
+        rew.ndim == 2
+        and rew.size() == end.size() == trunc.size() == val_bootstrap.size()
+    )
 
     rew = rew.sign()  # clip reward
 
@@ -39,14 +41,18 @@ def compute_lambda_returns(
     not_end = 1 - end
     not_trunc = 1 - trunc
 
-    lambda_returns = rew + not_end * gamma * (not_trunc * (1 - lambda_) + trunc) * val_bootstrap
+    lambda_returns = (
+        rew + not_end * gamma * (not_trunc * (1 - lambda_) + trunc) * val_bootstrap
+    )
 
     if lambda_ == 0:
         return lambda_returns
 
     last = val_bootstrap[:, -1]
     for t in reversed(range(rew.size(1))):
-        lambda_returns[:, t] += end_or_trunc[:, t].logical_not() * gamma * lambda_ * last
+        lambda_returns[:, t] += (
+            end_or_trunc[:, t].logical_not() * gamma * lambda_ * last
+        )
         last = lambda_returns[:, t]
 
     return lambda_returns
@@ -92,7 +98,7 @@ class ActorCritic(nn.Module):
         return self.lstm.weight_hh.device
 
     @torch.no_grad()
-    def burn_in(self, context):                 # (b, t, z)
+    def burn_in(self, context):  # (b, t, z)
         assert self.hx is not None
         assert self.cx is not None
         assert context.ndim == 3
@@ -101,7 +107,7 @@ class ActorCritic(nn.Module):
         for t in range(context.size(1)):
             self.hx, self.cx = self.lstm(context[:, t], (self.hx, self.cx))
 
-    def predict_act_value(self, obs):            # (b, z)
+    def predict_act_value(self, obs):  # (b, z)
         assert self.hx is not None
         assert self.cx is not None
         assert obs.ndim == 1 or obs.ndim == 2
@@ -114,9 +120,10 @@ class ActorCritic(nn.Module):
 
         return act_logit, val, (self.hx, self.cx)
 
+
 class Agent(nn.Module):
-    """
-    """
+    """ """
+
     def __init__(
         self,
         input_dim,
@@ -142,14 +149,12 @@ class Agent(nn.Module):
         ).to(self.device)
 
     def set_memory(self, hx_cx):
-        """
-        """
+        """ """
         self.model.hx = hx_cx[0]
         self.model.cx = hx_cx[1]
 
     def reset(self, n):
-        """
-        """
+        """ """
         self.model.hx = torch.zeros(n, self.hidden_dim, device=self.device)
         self.model.cx = torch.zeros(n, self.hidden_dim, device=self.device)
         return (self.model.hx, self.model.cx)
@@ -158,26 +163,48 @@ class Agent(nn.Module):
         self.model.hx = None
         self.model.cx = None
 
+    def reset_selected(self, should_reset):
+        """
+        Zero recurrent state for a subset of environments while keeping the
+        remaining rollout memory intact.
+        """
+        assert self.model.hx is not None
+        assert self.model.cx is not None
+        assert should_reset.ndim == 1
+
+        if not torch.any(should_reset):
+            return
+
+        reset_mask = should_reset.to(self.device).unsqueeze(1)
+        self.model.hx = torch.where(
+            reset_mask,
+            torch.zeros_like(self.model.hx),
+            self.model.hx,
+        )
+        self.model.cx = torch.where(
+            reset_mask,
+            torch.zeros_like(self.model.cx),
+            self.model.cx,
+        )
+
     @torch.no_grad()
     def burn_in(self, context):
-        """
-        """
+        """ """
         self.model.burn_in(context)
         return (self.model.hx, self.model.cx)
-    
+
     @torch.no_grad()
     def act(self, obs, deterministic):
-        """
-        """
+        """ """
         if obs.ndim == 1:
             obs = obs.unsqueeze(0)
-        
+
         act_logit, _, hx_cx = self.model.predict_act_value(obs)
         if deterministic:
             action = torch.argmax(act_logit, dim=-1)
         else:
             action = Categorical(logits=act_logit).sample()
-        
+
         return int(action.item()), hx_cx
 
     def imagine(self, imagination_env):
@@ -189,14 +216,14 @@ class Agent(nn.Module):
         the loss ignores all steps after the first dead step.
         """
         with torch.no_grad():
-            context = imagination_env.reset(self.num_envs)              # (b, t, z)
+            context = imagination_env.reset(self.num_envs)  # (b, t, z)
 
         context = context.to(self.device)
-        obs = context[:, -1]                                            # (b, z)
+        obs = context[:, -1]  # (b, z)
 
         self.reset(self.num_envs)
 
-        burn_in_context = context[:, -self.burn_in_len - 1 : -1]            # (b, t, z)
+        burn_in_context = context[:, -self.burn_in_len - 1 : -1]  # (b, t, z)
         _ = self.burn_in(burn_in_context)
 
         all_actions = []
@@ -229,6 +256,8 @@ class Agent(nn.Module):
             mask = alive.float()
             dead = torch.logical_or(terminated, truncated)
             alive = torch.logical_and(alive, torch.logical_not(dead))
+
+            self.reset_selected(dead)
 
             all_actions.append(action)
             all_rewards.append(rew)
@@ -294,7 +323,9 @@ class Agent(nn.Module):
 
         loss_actions = (-(log_prob * advantage.detach()) * mask).sum() / valid_count
 
-        loss_values = ((vals - lambda_returns.detach()).pow(2) * mask).sum() / valid_count
+        loss_values = (
+            (vals - lambda_returns.detach()).pow(2) * mask
+        ).sum() / valid_count
         loss_values = cfg.weight_value_loss * loss_values
 
         entropy = (entropy * mask).sum() / valid_count

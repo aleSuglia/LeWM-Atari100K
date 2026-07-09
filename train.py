@@ -4,11 +4,11 @@ from pathlib import Path
 
 import hydra
 import numpy as np
+import stable_pretraining
 import torch
 from accelerate import Accelerator
 from omegaconf import OmegaConf
 
-import stable_pretraining
 from lewm.imagination import ImaginationEnv
 from lewm.modules import DistributedSIGReg
 from utils import build_optimizer, log_wandb, try_wandb_init
@@ -27,6 +27,7 @@ def _normalize_mixed_precision(precision):
 
 
 @torch.no_grad()
+@torch.inference_mode()
 def collect_real_interactions(
     num_interactions,
     is_random,
@@ -191,14 +192,11 @@ def train_agent(
             for name, value in metrics.items()
         }
         detached_metrics = {
-            name: float(value.cpu())
-            for name, value in reduced_metrics.items()
+            name: float(value.cpu()) for name, value in reduced_metrics.items()
         }
 
         if metric_tracker is None:
-            metric_tracker = {
-                name: 0.0 for name in detached_metrics
-            }
+            metric_tracker = {name: 0.0 for name in detached_metrics}
 
         for name, value in detached_metrics.items():
             metric_tracker[name] += value
@@ -210,12 +208,10 @@ def train_agent(
     if num_steps == 0 or metric_tracker is None:
         return {}
 
-    return {
-        name: value / num_steps
-        for name, value in metric_tracker.items()
-    }
+    return {name: value / num_steps for name, value in metric_tracker.items()}
 
 
+@torch.inference_mode()
 def eval_agent(
     episodes,
     per_episode_limit,
@@ -249,12 +245,11 @@ def eval_agent(
         while not done:
             obs_tensor = torch.from_numpy(obs).unsqueeze(0).unsqueeze(0).to(device)
 
-            with torch.no_grad():
-                emb = world_model.encode(obs_tensor).squeeze(1)
-                action, _ = agent.act(
-                    emb,
-                    deterministic=True,
-                )
+            emb = world_model.encode(obs_tensor).squeeze(1)
+            action, _ = agent.act(
+                emb,
+                deterministic=True,
+            )
 
             obs, reward, terminated, truncated, _ = eval_env.step(int(action))
 
@@ -346,7 +341,7 @@ def run(cfg):
 
     # Keep original SIGReg on CPU/single-device runs; use distributed SIGReg
     # when more than one CUDA device is available.
-    if device.type == "cuda" and torch.cuda.device_count() > 1:
+    if device.type == "cuda" and accelerator.num_processes > 1:
         base_sigreg = world_model.sigreg
         world_model.sigreg = DistributedSIGReg(
             knots=int(base_sigreg.t.numel()),
@@ -389,6 +384,9 @@ def run(cfg):
         wm_optimizer,
         agent_optimizer,
     )
+
+    # Rebind imagination env after Accelerate has wrapped/moved the world model.
+    imagination_env.bind_world_model(world_model)
 
     if hasattr(agent, "module"):
         agent.module.device = device
@@ -457,10 +455,16 @@ def run(cfg):
 
         # Training World Model
         wm_train_epochs = None
-        if cfg.wm_schedule.start_epoch <= epoch_num < cfg.wm_schedule.periodic_start_epoch:
+        if (
+            cfg.wm_schedule.start_epoch
+            <= epoch_num
+            < cfg.wm_schedule.periodic_start_epoch
+        ):
             wm_train_epochs = cfg.wm_schedule.regular_epochs
         elif (
-            cfg.wm_schedule.periodic_start_epoch <= epoch_num <= cfg.wm_schedule.stop_epoch
+            cfg.wm_schedule.periodic_start_epoch
+            <= epoch_num
+            <= cfg.wm_schedule.stop_epoch
             and epoch_num % cfg.wm_schedule.period == 0
         ):
             wm_train_epochs = cfg.wm_schedule.periodic_epochs

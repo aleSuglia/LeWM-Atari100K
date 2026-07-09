@@ -6,9 +6,10 @@ trainer:
   total_epochs: 8
   precision: "no"
 
-collection_trainer:
+collection_schedule:
   collection_limit: 1_600
   collection_per_epoch: 200
+  random_collection_epochs: 1
 
 wm_schedule:
   steps_per_epoch: 8
