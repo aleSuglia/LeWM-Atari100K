@@ -310,6 +310,8 @@ def eval_agent(
     """
     Evaluate policy in real environment.
     """
+    print(f"{progress_prefix} device: {device}", flush=True)
+
     world_model.eval()
     agent.eval()
 

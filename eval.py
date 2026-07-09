@@ -4,6 +4,7 @@ from pathlib import Path
 import hydra
 import numpy as np
 import torch
+from accelerate import Accelerator
 from omegaconf import OmegaConf
 
 
@@ -21,8 +22,46 @@ def _log_progress(prefix, current, total):
     print(f"{prefix} {current}/{total}", flush=True)
 
 
+def _resolve_eval_device(configured_device):
+    preferred = str(configured_device).lower()
+
+    if preferred.startswith("cuda"):
+        if torch.cuda.is_available():
+            return torch.device(preferred)
+    elif preferred.startswith("mps"):
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+    elif preferred == "cpu":
+        # Prefer GPU for evaluation when available even if config defaults to CPU.
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 @hydra.main(version_base=None, config_path="./config", config_name="config")
 def run(cfg):
+    accelerator = Accelerator()
+
+    if not accelerator.is_main_process:
+        accelerator.wait_for_everyone()
+        return
+
+    eval_device = accelerator.device
+    if eval_device.type == "cpu":
+        # Keep fallback preference logic when Accelerate is on CPU.
+        eval_device = _resolve_eval_device(cfg.device)
+
+    OmegaConf.update(cfg, "device", str(eval_device), merge=False)
+    OmegaConf.update(cfg, "agent.device", str(eval_device), merge=False)
+
     # Env
     atari_env = hydra.utils.instantiate(cfg.env)
     num_actions = atari_env.num_actions
@@ -53,12 +92,18 @@ def run(cfg):
     agent_ckp_path = agent_ckp_dir / file_name
 
     # Load saved models
-    wm_state_dict = torch.load(wm_ckp_path)
-    agent_state_dict = torch.load(agent_ckp_path)
+    wm_state_dict = torch.load(wm_ckp_path, map_location=eval_device)
+    agent_state_dict = torch.load(agent_ckp_path, map_location=eval_device)
     world_model.load_state_dict(wm_state_dict)
     agent.load_state_dict(agent_state_dict)
-    world_model.to(cfg.device)
-    agent.to(cfg.device)
+    world_model.to(eval_device)
+    agent.to(eval_device)
+
+    print(
+        f"evaluation main process on device: {eval_device} "
+        f"(process {accelerator.process_index}/{accelerator.num_processes})",
+        flush=True,
+    )
 
     world_model.eval()
     agent.eval()
@@ -76,7 +121,7 @@ def run(cfg):
         length = 0
 
         while not done:
-            obs = torch.from_numpy(obs).unsqueeze(0).unsqueeze(0).to(cfg.device)
+            obs = torch.from_numpy(obs).unsqueeze(0).unsqueeze(0).to(eval_device)
 
             with torch.no_grad():
                 emb = world_model.encode(obs)
@@ -114,6 +159,8 @@ def run(cfg):
     output_path = Path(cfg.eval.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+
+    accelerator.wait_for_everyone()
 
 
 if __name__ == "__main__":
