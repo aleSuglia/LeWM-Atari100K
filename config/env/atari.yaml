@@ -2,7 +2,7 @@ _target_: atari.env.AtariEnv
 
 game: ${game}
 
-img_size: [160, 160]
+img_size: [64, 64]
 processed_img_size: ${img_size}
 grayscale_obs: false
 action_repeat: 4

@@ -2,11 +2,16 @@ _target_: lewm.lewm.LeWM
 
 encoder:
   _target_: stable_pretraining.backbone.utils.vit_hf
-  size: tiny                                                        # Decides output dimension (== embed_dim)
-  patch_size: 8
+  size: small
+  patch_size: 4
   image_size: ${img_size}
   pretrained: false
   use_mask_token: false
+  
+  # Additions
+  hidden_size: ${embed_dim}
+  num_attention_heads: 8                              # hidden_size % num_attention_heads = integer (for small, attention_heads = 6)
+  intermediate_size: ${eval:${embed_dim} * 4}         # 4 x hidden_size
 
 predictor:
   _target_: lewm.modules.ARPredictor

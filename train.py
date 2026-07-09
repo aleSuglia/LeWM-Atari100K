@@ -8,9 +8,13 @@ import torch
 from accelerate import Accelerator
 from omegaconf import OmegaConf
 
+import stable_pretraining
 from lewm.imagination import ImaginationEnv
 from lewm.modules import DistributedSIGReg
 from utils import build_optimizer, log_wandb, try_wandb_init
+
+# Keep module import for side effects (model/registry registration).
+_ = stable_pretraining
 
 
 def _normalize_mixed_precision(precision):
@@ -22,45 +26,58 @@ def _normalize_mixed_precision(precision):
     return "no"
 
 
+@torch.no_grad()
 def collect_real_interactions(
-    num_interactions, obs, agent, world_model, env, writer, device
+    num_interactions,
+    is_random,
+    obs,
+    agent,
+    memory,
+    world_model,
+    env,
+    writer,
+    device,
 ):
     """
-    collect given number of real interactions
+    Collect given number of real interactions.
     """
     agent.eval()
     world_model.eval()
 
-    needs_reset = False
+    agent.set_memory(memory)
 
     for _ in range(num_interactions):
-        if needs_reset:
-            obs, _ = env.reset()
+        obs_tensor = torch.from_numpy(obs).unsqueeze(0).unsqueeze(0).to(device)
 
-        obs = torch.from_numpy(obs).unsqueeze(0).unsqueeze(0).to(device)
-
-        with torch.no_grad():
-            emb = world_model.encode(obs)
-            action = agent.predict(
+        emb = world_model.encode(obs_tensor).squeeze(1)
+        if not is_random:
+            action, memory = agent.act(
                 emb,
-                deterministic=False,  # Exploration
+                deterministic=False,
             )
+        else:
+            action = random.randint(0, env.num_actions - 1)
 
         next_obs, reward, terminated, truncated, _ = env.step(int(action))
 
         done = int(terminated or truncated)
         writer.append(
-            obs.cpu().numpy(),
+            obs_tensor.cpu().numpy(),
             action,
             reward,
             done,
         )
 
         obs = next_obs
-        needs_reset = terminated or truncated
+
+        if terminated or truncated:
+            obs, _ = env.reset()
+            memory = agent.reset(1)
 
     writer.flush()
-    return obs
+    agent.clear()
+
+    return obs, memory
 
 
 def train_world_model(
@@ -73,7 +90,9 @@ def train_world_model(
     optimizer,
     accelerator,
 ):
-    """ """
+    """
+    Train world model for one pass over refreshed replay data.
+    """
     dataset.refresh()
 
     world_model.train()
@@ -137,6 +156,66 @@ def train_world_model(
     }
 
 
+def train_agent(
+    agent,
+    optimizer,
+    trainer_cfg,
+    imagination_env,
+    accelerator,
+):
+    """
+    Train policy on imagined trajectories for one epoch.
+    """
+    agent.train()
+    imagination_env.world_model.eval()
+
+    metric_tracker = None
+    num_steps = 0
+
+    for _ in range(trainer_cfg.steps_per_epoch):
+        rollout = agent.imagine(imagination_env)
+        loss, metrics = agent.loss(rollout, trainer_cfg)
+
+        optimizer.zero_grad()
+        accelerator.backward(loss)
+
+        clip_val = trainer_cfg.gradient_clip_val
+        if clip_val is not None and clip_val > 0:
+            accelerator.clip_grad_norm_(agent.parameters(), clip_val)
+
+        optimizer.step()
+        agent.clear()
+
+        reduced_metrics = {
+            name: accelerator.gather_for_metrics(value.detach()).mean()
+            for name, value in metrics.items()
+        }
+        detached_metrics = {
+            name: float(value.cpu())
+            for name, value in reduced_metrics.items()
+        }
+
+        if metric_tracker is None:
+            metric_tracker = {
+                name: 0.0 for name in detached_metrics
+            }
+
+        for name, value in detached_metrics.items():
+            metric_tracker[name] += value
+
+        num_steps += 1
+
+    agent.clear()
+
+    if num_steps == 0 or metric_tracker is None:
+        return {}
+
+    return {
+        name: value / num_steps
+        for name, value in metric_tracker.items()
+    }
+
+
 def eval_agent(
     episodes,
     per_episode_limit,
@@ -148,8 +227,11 @@ def eval_agent(
     at_end=False,
     eval_path=None,
 ):
-    """ """
+    """
+    Evaluate policy in real environment.
+    """
     world_model.eval()
+    agent.eval()
 
     reward_history = []
     length_history = []
@@ -157,6 +239,7 @@ def eval_agent(
     eval_env = hydra.utils.instantiate(env_cfg)
 
     for ep_idx in range(episodes):
+        _ = agent.reset(1)
         obs, _ = eval_env.reset(seed + ep_idx)
 
         done = False
@@ -164,13 +247,13 @@ def eval_agent(
         length = 0
 
         while not done:
-            obs = torch.from_numpy(obs).unsqueeze(0).unsqueeze(0).to(device)
+            obs_tensor = torch.from_numpy(obs).unsqueeze(0).unsqueeze(0).to(device)
 
             with torch.no_grad():
-                emb = world_model.encode(obs)
-                action = agent.predict(
+                emb = world_model.encode(obs_tensor).squeeze(1)
+                action, _ = agent.act(
                     emb,
-                    deterministic=True,  # Exploitation
+                    deterministic=True,
                 )
 
             obs, reward, terminated, truncated, _ = eval_env.step(int(action))
@@ -186,6 +269,7 @@ def eval_agent(
         reward_history.append(total_return)
         length_history.append(length)
 
+    agent.clear()
     eval_env.close()
     result = {
         "episodes": episodes,
@@ -280,7 +364,9 @@ def run(cfg):
 
     # Imagination Env
     imagination_env = ImaginationEnv(
-        world_model=world_model, dataset=dataset, **cfg.imagination
+        world_model=world_model,
+        dataset=dataset,
+        **cfg.imagination,
     )
 
     # Agent
@@ -313,12 +399,16 @@ def run(cfg):
     ##      Training       ##
     #########################
 
-    # Initial observation
-    obs, _ = atari_env.reset(seed=cfg.seed)
+    obs = None
+    memory = None
+    if accelerator.is_main_process:
+        obs, _ = atari_env.reset(seed=cfg.seed)
+        agent_for_env = accelerator.unwrap_model(agent)
+        memory = agent_for_env.reset(1)
 
     # Tracking values
     total_collected_interactions = 0
-    collection_per_epoch = cfg.collection_trainer.collection_per_epoch
+    collection_per_epoch = cfg.collection_schedule.collection_per_epoch
 
     # Creating directories for checkpointing
     wm_ckp_dir = Path(cfg.checkpointing.wm_path)
@@ -329,21 +419,26 @@ def run(cfg):
 
     # Training Loop
     for epoch_idx in range(cfg.trainer.total_epochs):
+        epoch_num = epoch_idx + 1
         if accelerator.is_main_process:
-            print("running epoch: ", epoch_idx + 1)
+            print("running epoch: ", epoch_num)
 
         # Collection
-        if total_collected_interactions < cfg.collection_trainer.collection_limit:
+        is_random = epoch_num < cfg.collection_schedule.random_collection_epochs
+
+        if total_collected_interactions < cfg.collection_schedule.collection_limit:
             total_collected_interactions += collection_per_epoch
 
             if accelerator.is_main_process:
                 assert replay_writer is not None
                 agent_for_env = accelerator.unwrap_model(agent)
                 wm_for_env = accelerator.unwrap_model(world_model)
-                obs = collect_real_interactions(
+                obs, memory = collect_real_interactions(
                     num_interactions=collection_per_epoch,
+                    is_random=is_random,
                     obs=obs,
                     agent=agent_for_env,
+                    memory=memory,
                     world_model=wm_for_env,
                     env=atari_env,
                     writer=replay_writer,
@@ -351,7 +446,9 @@ def run(cfg):
                 )
 
                 log_wandb(
-                    wandb_run, {"replay/collection_size": replay_writer.size}, epoch_idx
+                    wandb_run,
+                    {"replay/collection_size": replay_writer.size},
+                    epoch_idx,
                 )
 
                 print("collection complete. size: ", replay_writer.size)
@@ -360,21 +457,16 @@ def run(cfg):
 
         # Training World Model
         wm_train_epochs = None
-        if (
-            cfg.wm_schedule.start_epoch
-            <= (epoch_idx + 1)
-            < cfg.wm_schedule.periodic_start_epoch
-        ):
+        if cfg.wm_schedule.start_epoch <= epoch_num < cfg.wm_schedule.periodic_start_epoch:
             wm_train_epochs = cfg.wm_schedule.regular_epochs
         elif (
-            cfg.wm_schedule.periodic_start_epoch
-            <= (epoch_idx + 1)
-            <= cfg.wm_schedule.stop_epoch
-            and (epoch_idx + 1) % cfg.wm_schedule.period == 0
+            cfg.wm_schedule.periodic_start_epoch <= epoch_num <= cfg.wm_schedule.stop_epoch
+            and epoch_num % cfg.wm_schedule.period == 0
         ):
             wm_train_epochs = cfg.wm_schedule.periodic_epochs
 
         if wm_train_epochs is not None:
+            wm_losses = {}
             for _ in range(wm_train_epochs):
                 wm_losses = train_world_model(
                     world_model=world_model,
@@ -388,51 +480,52 @@ def run(cfg):
                 )
             accelerator.wait_for_everyone()
 
-            log_wandb(
-                wandb_run,
-                {f"world_model/{key}": value for key, value in wm_losses.items()},
-                epoch_idx,
-            )
-
             if accelerator.is_main_process:
+                log_wandb(
+                    wandb_run,
+                    {f"world_model/{key}": value for key, value in wm_losses.items()},
+                    epoch_idx,
+                )
+
                 print("world model training complete. losses:")
                 print(wm_losses)
 
         # Checkpointing World Model
         if (
-            (epoch_idx + 1) % cfg.checkpointing.wm_per_epoch == 0
+            epoch_num % cfg.checkpointing.wm_per_epoch == 0
         ) and accelerator.is_main_process:
-            file_name = f"epoch_{epoch_idx + 1}.pt"
+            file_name = f"epoch_{epoch_num}.pt"
             wm_ckp_path = wm_ckp_dir / file_name
             accelerator.save(
                 accelerator.unwrap_model(world_model).state_dict(), wm_ckp_path
             )
 
         # Training Agent
-        if epoch_idx + 1 >= cfg.agent_trainer.agent_start_epoch:
-            agent_losses = agent.learn(
-                imagination_env,
-                cfg.agent_trainer,
-                agent_optimizer,
+        if epoch_num >= cfg.agent_trainer.agent_start_epoch:
+            agent_losses = train_agent(
+                agent=agent,
+                optimizer=agent_optimizer,
+                trainer_cfg=cfg.agent_trainer,
+                imagination_env=imagination_env,
                 accelerator=accelerator,
             )
             accelerator.wait_for_everyone()
 
-            log_wandb(
-                wandb_run,
-                {f"agent/{key}": value for key, value in agent_losses.items()},
-                epoch_idx,
-            )
-
             if accelerator.is_main_process:
+                log_wandb(
+                    wandb_run,
+                    {f"agent/{key}": value for key, value in agent_losses.items()},
+                    epoch_idx,
+                )
+
                 print("agent training done. losses: ")
                 print(agent_losses)
 
         # Checkpointing Agent
         if (
-            (epoch_idx + 1) % cfg.checkpointing.agent_per_epoch == 0
+            epoch_num % cfg.checkpointing.agent_per_epoch == 0
         ) and accelerator.is_main_process:
-            file_name = f"epoch_{epoch_idx + 1}.pt"
+            file_name = f"epoch_{epoch_num}.pt"
             agent_ckp_path = agent_ckp_dir / file_name
             accelerator.save(
                 accelerator.unwrap_model(agent).state_dict(), agent_ckp_path
@@ -440,7 +533,7 @@ def run(cfg):
 
         # Sanity Eval Checks
         if (
-            (epoch_idx + 1) % cfg.sanity_eval.every_x_epoch == 0
+            epoch_num % cfg.sanity_eval.every_x_epoch == 0
         ) and accelerator.is_main_process:
             agent_for_eval = accelerator.unwrap_model(agent)
             wm_for_eval = accelerator.unwrap_model(world_model)
@@ -449,9 +542,9 @@ def run(cfg):
                 per_episode_limit=cfg.sanity_eval.per_episode_limit,
                 agent=agent_for_eval,
                 world_model=wm_for_eval,
-                seed=cfg.seed,
                 env_cfg=cfg.env,
                 device=device,
+                seed=cfg.seed,
                 at_end=False,
             )
             log_wandb(
@@ -489,9 +582,9 @@ def run(cfg):
             per_episode_limit=cfg.eval.per_episode_limit,
             agent=accelerator.unwrap_model(agent),
             world_model=accelerator.unwrap_model(world_model),
-            seed=cfg.seed,
             env_cfg=cfg.env,
             device=device,
+            seed=cfg.seed,
             at_end=True,
             eval_path=cfg.eval.output_path,
         )

@@ -4,7 +4,7 @@ defaults:
   - local: log
   - env: atari
   - model: lewm
-  - agent: ppo
+  - agent: agent
 
 seed: 0
 game: pong
@@ -14,9 +14,9 @@ device: cuda
 # Shared model/data dimensions
 # -----------------------------------------------------------------------------
 
-img_size: 128
-embed_dim: 192
-history_size: 6
+img_size: 64
+embed_dim: 1024
+history_size: 5
 
 # -----------------------------------------------------------------------------
 # Loss weighting
@@ -24,14 +24,14 @@ history_size: 6
 loss_weights:
   pred_loss: 1
   sigreg_loss: 0.3
-  rew_loss: 0.01
+  rew_loss: 0.03
   don_loss: 0.01
 
 # -----------------------------------------------------------------------------
 # Imagination
 # -----------------------------------------------------------------------------
 imagination:
-  max_horizon: 70
+  max_horizon: 50
   history_size: ${history_size}
   done_threshold: 0.5
 
@@ -39,7 +39,7 @@ imagination:
 # Training schedule
 # -----------------------------------------------------------------------------
 trainer:
-  total_epochs: 500
+  total_epochs: 600
   
   devices: auto
   accelerator: gpu
@@ -54,45 +54,44 @@ trainer:
 sanity_eval:
   every_x_epoch: 25
   episodes: 5
-  per_episode_limit: 10000
+  per_episode_limit: 5000
 
-collection_trainer:
-  collection_limit: 110_000                             # Completion = 440
-  collection_per_epoch: 250
+collection_schedule:
+  collection_limit: 100_200
+  collection_per_epoch: 200
+  random_collection_epochs: 10
 
 wm_schedule:
   steps_per_epoch: 256
-  start_epoch: 10
-  regular_epochs: 5
-  periodic_start_epoch: 20
+  start_epoch: 15
+  regular_epochs: 1
+  periodic_start_epoch: 60
   period: 5
-  periodic_epochs: 20
-  stop_epoch: 470
+  periodic_epochs: 5
+  stop_epoch: 530
 
 agent_trainer:
-  agent_start_epoch: 20
-  update_epochs: 4
-  total_steps: 1_000_000
+  agent_start_epoch: 60
+  steps_per_epoch: 200
 
-  gamma: 0.997
-  gae_lambda: 0.95
-  clip_coef: 0.2
-  ent_coef: 0.01
-  vf_coef: 0.5
-  max_grad_norm: 0.5
+  gamma: 0.995
+  lambda_: 0.95
+  weight_value_loss: 1.0
+  weight_entropy_loss: 0.001
+  gradient_clip_val: 10.0
 
   optimizer:
     type: AdamW
-    lr: 3e-4
+    lr: 1e-4
     weight_decay: 0.0
 
 # -----------------------------------------------------------------------------
 # Evaluation
 # -----------------------------------------------------------------------------
 eval:
-  episodes: 25
-  deterministic: true                                     # Not implemented
-  per_episode_limit: 25000
+  episodes: 100
+  deterministic: true
+  per_episode_limit: 108_000
   output_path: ./eval/${game}.json
 
 # -----------------------------------------------------------------------------
@@ -109,10 +108,10 @@ checkpointing:
 # -----------------------------------------------------------------------------
 loader:
   batch_size: 64
-  num_workers: 4
+  num_workers: 8
   pin_memory: true
   persistent_workers: true
-  prefetch_factor: 3
+  prefetch_factor: 2
 
 # -----------------------------------------------------------------------------
 # Replay storage

@@ -45,7 +45,7 @@ class AtariEnv:
             self,
             game,
             img_size,
-            processed_img_size=224,
+            processed_img_size,
             action_repeat=4,
             noop_max=30,
             repeat_action_probability=0.0,

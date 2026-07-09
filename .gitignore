@@ -24,5 +24,4 @@ eval
 playground/
 testing.ipynb
 NOTES.md
-dummy.yaml
-ppo_dummy.yaml
+*dummy.yaml
