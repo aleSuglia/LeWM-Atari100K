@@ -1,14 +1,27 @@
 import json
 from pathlib import Path
-import hydra
-from omegaconf import OmegaConf
 
+import hydra
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 
-import stable_pretraining
 
-@hydra.main(version_base=None, config_path='./config', config_name='config')
+def _progress_interval(total, chunks=10):
+    if total <= 0:
+        return 1
+    return max(1, total // chunks)
+
+
+def _log_progress(prefix, current, total):
+    interval = _progress_interval(total)
+    if current != total and current % interval != 0:
+        return
+
+    print(f"{prefix} {current}/{total}", flush=True)
+
+
+@hydra.main(version_base=None, config_path="./config", config_name="config")
 def run(cfg):
     # Env
     atari_env = hydra.utils.instantiate(cfg.env)
@@ -16,26 +29,26 @@ def run(cfg):
 
     OmegaConf.update(
         cfg,
-        'model.action_encoder.num_actions',
+        "model.action_encoder.num_actions",
         int(num_actions),
         merge=False,
     )
     OmegaConf.update(
         cfg,
-        'agent.num_actions',
+        "agent.num_actions",
         int(num_actions),
         merge=False,
-    )    
+    )
 
     # Instantiate models
     world_model = hydra.utils.instantiate(cfg.model)
     agent = hydra.utils.instantiate(cfg.agent)
-    
+
     # Prepare paths
     wm_ckp_dir = Path(cfg.checkpointing.wm_path)
     agent_ckp_dir = Path(cfg.checkpointing.agent_path)
 
-    file_name = f"final.pt"
+    file_name = "final.pt"
     wm_ckp_path = wm_ckp_dir / file_name
     agent_ckp_path = agent_ckp_dir / file_name
 
@@ -72,9 +85,9 @@ def run(cfg):
                     emb,
                     deterministic=cfg.eval.deterministic,
                 )
-            
+
             obs, reward, terminated, truncated, _ = atari_env.step(int(action))
-            
+
             done = terminated or truncated
 
             total_return += reward
@@ -82,9 +95,11 @@ def run(cfg):
 
             if length >= cfg.eval.per_episode_limit:
                 done = True
-        
+
         reward_history.append(total_return)
         length_history.append(length)
+
+        _log_progress("evaluation", ep_num + 1, cfg.eval.episodes)
 
     atari_env.close()
     result = {
@@ -93,12 +108,13 @@ def run(cfg):
         "ep_lengths": length_history,
         "mean_reward": np.mean(reward_history),
         "std_reward": np.std(reward_history),
-        "mean_length": np.mean(length_history)
+        "mean_length": np.mean(length_history),
     }
-    
+
     output_path = Path(cfg.eval.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(result, indent=2), encoding='utf-8')
+    output_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+
 
 if __name__ == "__main__":
     run()

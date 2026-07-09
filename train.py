@@ -33,10 +33,29 @@ def _rank_replay_path(base_path, rank):
     return base_path.with_name(f"{base_path.stem}.rank{rank}{base_path.suffix}")
 
 
+def _progress_interval(total, chunks=10):
+    if total <= 0:
+        return 1
+    return max(1, total // chunks)
+
+
+def _log_progress(prefix, current, total, suffix=""):
+    interval = _progress_interval(total)
+    if current != total and current % interval != 0:
+        return
+
+    message = f"{prefix} {current}/{total}"
+    if suffix:
+        message = f"{message} {suffix}"
+    print(message, flush=True)
+
+
 def _merge_rank_replay_shards(main_writer, shard_paths, shard_offsets):
     """
     Merge newly collected transitions from each rank shard into the main replay.
     """
+    total_shards = len(shard_paths)
+
     for rank_idx, shard_path in enumerate(shard_paths):
         with h5py.File(shard_path, "r") as shard_file:
             obs_ds = cast(h5py.Dataset, shard_file["obs"])
@@ -46,13 +65,20 @@ def _merge_rank_replay_shards(main_writer, shard_paths, shard_offsets):
 
             shard_size = int(action_ds.shape[0])
             start_idx = int(shard_offsets[rank_idx])
+            shard_total = max(0, shard_size - start_idx)
 
-            for idx in range(start_idx, shard_size):
+            for shard_offset, idx in enumerate(range(start_idx, shard_size), start=1):
                 main_writer.append(
                     obs_ds[idx],
                     int(action_ds[idx]),
                     float(reward_ds[idx]),
                     int(done_ds[idx]),
+                )
+
+                _log_progress(
+                    f"replay merge shard {rank_idx + 1}/{total_shards}",
+                    shard_offset,
+                    shard_total,
                 )
 
             shard_offsets[rank_idx] = shard_size
@@ -72,6 +98,8 @@ def collect_real_interactions(
     env,
     writer,
     device,
+    log_progress=False,
+    progress_prefix="collection",
 ):
     """
     Collect given number of real interactions.
@@ -81,7 +109,7 @@ def collect_real_interactions(
 
     agent.set_memory(memory)
 
-    for _ in range(num_interactions):
+    for interaction_idx in range(num_interactions):
         obs_tensor = torch.from_numpy(obs).unsqueeze(0).unsqueeze(0).to(device)
 
         emb = world_model.encode(obs_tensor).squeeze(1)
@@ -109,6 +137,9 @@ def collect_real_interactions(
             obs, _ = env.reset()
             memory = agent.reset(1)
 
+        if log_progress:
+            _log_progress(progress_prefix, interaction_idx + 1, num_interactions)
+
     writer.flush()
     agent.clear()
 
@@ -124,6 +155,8 @@ def train_world_model(
     history_size,
     optimizer,
     accelerator,
+    log_progress=False,
+    progress_prefix="world model",
 ):
     """
     Train world model for one pass over refreshed replay data.
@@ -140,7 +173,12 @@ def train_world_model(
     global_loss_tracker = None
     num_total_batches = 0
 
-    for batch in dataloader:
+    try:
+        num_batches = len(dataloader)
+    except TypeError:
+        num_batches = 0
+
+    for batch_idx, batch in enumerate(dataloader, start=1):
         observations = batch["obs"].float()
         actions = batch["action"].long()
         rewards = batch["reward"].float()
@@ -183,6 +221,9 @@ def train_world_model(
 
         num_total_batches += 1
 
+        if log_progress and accelerator.is_main_process:
+            _log_progress(progress_prefix, batch_idx, num_batches or batch_idx)
+
     if num_total_batches == 0 or global_loss_tracker is None:
         return {}
 
@@ -197,6 +238,8 @@ def train_agent(
     trainer_cfg,
     imagination_env,
     accelerator,
+    log_progress=False,
+    progress_prefix="agent",
 ):
     """
     Train policy on imagined trajectories for one epoch.
@@ -207,7 +250,9 @@ def train_agent(
     metric_tracker = None
     num_steps = 0
 
-    for _ in range(trainer_cfg.steps_per_epoch):
+    total_steps = int(trainer_cfg.steps_per_epoch)
+
+    for step_idx in range(total_steps):
         rollout = agent.imagine(imagination_env)
         loss, metrics = agent.loss(rollout, trainer_cfg)
 
@@ -237,6 +282,9 @@ def train_agent(
 
         num_steps += 1
 
+        if log_progress and accelerator.is_main_process:
+            _log_progress(progress_prefix, step_idx + 1, total_steps)
+
     agent.clear()
 
     if num_steps == 0 or metric_tracker is None:
@@ -256,6 +304,8 @@ def eval_agent(
     seed,
     at_end=False,
     eval_path=None,
+    log_progress=True,
+    progress_prefix="evaluation",
 ):
     """
     Evaluate policy in real environment.
@@ -297,6 +347,9 @@ def eval_agent(
 
         reward_history.append(total_return)
         length_history.append(length)
+
+        if log_progress:
+            _log_progress(progress_prefix, ep_idx + 1, episodes)
 
     agent.clear()
     eval_env.close()
@@ -503,6 +556,8 @@ def run(cfg):
                 env=atari_env,
                 writer=collection_writer,
                 device=device,
+                log_progress=accelerator.is_main_process,
+                progress_prefix="collection",
             )
 
             accelerator.wait_for_everyone()
@@ -556,6 +611,8 @@ def run(cfg):
                     history_size=cfg.history_size,
                     optimizer=wm_optimizer,
                     accelerator=accelerator,
+                    log_progress=True,
+                    progress_prefix="world model",
                 )
             accelerator.wait_for_everyone()
 
@@ -587,6 +644,8 @@ def run(cfg):
                 trainer_cfg=cfg.agent_trainer,
                 imagination_env=imagination_env,
                 accelerator=accelerator,
+                log_progress=True,
+                progress_prefix="agent",
             )
             accelerator.wait_for_everyone()
 
@@ -625,6 +684,8 @@ def run(cfg):
                 device=device,
                 seed=cfg.seed,
                 at_end=False,
+                log_progress=True,
+                progress_prefix="sanity eval",
             )
             log_wandb(
                 wandb_run,
@@ -666,6 +727,8 @@ def run(cfg):
             seed=cfg.seed,
             at_end=True,
             eval_path=cfg.eval.output_path,
+            log_progress=True,
+            progress_prefix="final eval",
         )
 
     atari_env.close()
