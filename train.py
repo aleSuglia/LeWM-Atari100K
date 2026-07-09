@@ -1,7 +1,9 @@
 import json
 import random
 from pathlib import Path
+from typing import cast
 
+import h5py
 import hydra
 import numpy as np
 import stable_pretraining
@@ -24,6 +26,39 @@ def _normalize_mixed_precision(precision):
     if value in {"fp16", "16", "16-mixed"}:
         return "fp16"
     return "no"
+
+
+def _rank_replay_path(base_path, rank):
+    base_path = Path(base_path)
+    return base_path.with_name(f"{base_path.stem}.rank{rank}{base_path.suffix}")
+
+
+def _merge_rank_replay_shards(main_writer, shard_paths, shard_offsets):
+    """
+    Merge newly collected transitions from each rank shard into the main replay.
+    """
+    for rank_idx, shard_path in enumerate(shard_paths):
+        with h5py.File(shard_path, "r") as shard_file:
+            obs_ds = cast(h5py.Dataset, shard_file["obs"])
+            action_ds = cast(h5py.Dataset, shard_file["action"])
+            reward_ds = cast(h5py.Dataset, shard_file["reward"])
+            done_ds = cast(h5py.Dataset, shard_file["done"])
+
+            shard_size = int(action_ds.shape[0])
+            start_idx = int(shard_offsets[rank_idx])
+
+            for idx in range(start_idx, shard_size):
+                main_writer.append(
+                    obs_ds[idx],
+                    int(action_ds[idx]),
+                    float(reward_ds[idx]),
+                    int(done_ds[idx]),
+                )
+
+            shard_offsets[rank_idx] = shard_size
+
+    main_writer.flush()
+    return shard_offsets
 
 
 @torch.inference_mode()
@@ -347,10 +382,42 @@ def run(cfg):
             num_proj=int(base_sigreg.num_proj),
         )
 
-    # Replay Writer (single-process write to avoid HDF5 corruption)
-    replay_writer = (
-        hydra.utils.instantiate(cfg.replay) if accelerator.is_main_process else None
-    )
+    # Replay writers.
+    # Single-process: one canonical replay file.
+    # Multi-process: each rank writes to its own shard; rank 0 merges shards.
+    use_sharded_collection = accelerator.num_processes > 1
+
+    replay_writer = None
+    collection_writer = None
+    shard_paths = []
+    shard_offsets = None
+
+    if use_sharded_collection:
+        replay_path = Path(cfg.replay.path)
+        shard_path = _rank_replay_path(replay_path, accelerator.process_index)
+
+        collection_writer = hydra.utils.instantiate(
+            cfg.replay,
+            path=str(shard_path),
+            mode="w",
+        )
+
+        shard_paths = [
+            _rank_replay_path(replay_path, rank_idx)
+            for rank_idx in range(accelerator.num_processes)
+        ]
+
+        if accelerator.is_main_process:
+            replay_writer = hydra.utils.instantiate(
+                cfg.replay,
+                path=str(replay_path),
+                mode="w",
+            )
+            shard_offsets = [0 for _ in range(accelerator.num_processes)]
+    else:
+        replay_writer = hydra.utils.instantiate(cfg.replay, mode="w")
+        collection_writer = replay_writer
+
     accelerator.wait_for_everyone()
 
     # Dataset
@@ -396,12 +463,9 @@ def run(cfg):
     ##      Training       ##
     #########################
 
-    obs = None
-    memory = None
-    if accelerator.is_main_process:
-        obs, _ = atari_env.reset(seed=cfg.seed)
-        agent_for_env = accelerator.unwrap_model(agent)
-        memory = agent_for_env.reset(1)
+    obs, _ = atari_env.reset(seed=cfg.seed + accelerator.process_index)
+    agent_for_env = accelerator.unwrap_model(agent)
+    memory = agent_for_env.reset(1)
 
     # Tracking values
     total_collected_interactions = 0
@@ -426,22 +490,36 @@ def run(cfg):
         if total_collected_interactions < cfg.collection_schedule.collection_limit:
             total_collected_interactions += collection_per_epoch
 
-            if accelerator.is_main_process:
+            assert collection_writer is not None
+            agent_for_env = accelerator.unwrap_model(agent)
+            wm_for_env = accelerator.unwrap_model(world_model)
+            obs, memory = collect_real_interactions(
+                num_interactions=collection_per_epoch,
+                is_random=is_random,
+                obs=obs,
+                agent=agent_for_env,
+                memory=memory,
+                world_model=wm_for_env,
+                env=atari_env,
+                writer=collection_writer,
+                device=device,
+            )
+
+            accelerator.wait_for_everyone()
+
+            if use_sharded_collection and accelerator.is_main_process:
                 assert replay_writer is not None
-                agent_for_env = accelerator.unwrap_model(agent)
-                wm_for_env = accelerator.unwrap_model(world_model)
-                obs, memory = collect_real_interactions(
-                    num_interactions=collection_per_epoch,
-                    is_random=is_random,
-                    obs=obs,
-                    agent=agent_for_env,
-                    memory=memory,
-                    world_model=wm_for_env,
-                    env=atari_env,
-                    writer=replay_writer,
-                    device=device,
+                assert shard_offsets is not None
+                shard_offsets = _merge_rank_replay_shards(
+                    main_writer=replay_writer,
+                    shard_paths=shard_paths,
+                    shard_offsets=shard_offsets,
                 )
 
+            accelerator.wait_for_everyone()
+
+            if accelerator.is_main_process:
+                assert replay_writer is not None
                 log_wandb(
                     wandb_run,
                     {"replay/collection_size": replay_writer.size},
@@ -449,8 +527,6 @@ def run(cfg):
                 )
 
                 print("collection complete. size: ", replay_writer.size)
-
-            accelerator.wait_for_everyone()
 
         # Training World Model
         wm_train_epochs = None
@@ -593,7 +669,9 @@ def run(cfg):
         )
 
     atari_env.close()
-    if replay_writer is not None:
+    if collection_writer is not None:
+        collection_writer.close()
+    if replay_writer is not None and replay_writer is not collection_writer:
         replay_writer.close()
     dataset.close()
     if wandb_run is not None:
