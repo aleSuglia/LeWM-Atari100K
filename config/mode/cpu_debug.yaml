@@ -1,0 +1,40 @@
+# @package _global_
+# Fast local debug profile for CPU runs.
+device: cpu
+
+trainer:
+  total_epochs: 8
+  precision: "no"
+
+collection_trainer:
+  collection_limit: 1_600
+  collection_per_epoch: 200
+
+wm_schedule:
+  steps_per_epoch: 8
+  start_epoch: 1
+  regular_epochs: 1
+  periodic_start_epoch: 999999
+  periodic_epochs: 1
+  stop_epoch: 8
+
+agent_trainer:
+  agent_start_epoch: 999999
+
+sanity_eval:
+  every_x_epoch: 999999
+
+eval:
+  episodes: 1
+  per_episode_limit: 1000
+
+loader:
+  batch_size: 8
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  prefetch_factor: null
+
+dataset:
+  seq_len: 8
+  num_batches: ${wm_schedule.steps_per_epoch}

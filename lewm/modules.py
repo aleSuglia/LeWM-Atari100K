@@ -1,11 +1,17 @@
+from typing import cast
+
 import torch
-from torch import nn
+import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn
 import torch.nn.functional as F
 from einops import rearrange
+from torch import nn
+
 
 def modulate(x, shift, scale):
     """AdaLN-zero modulation"""
     return x * (1 + scale) + shift
+
 
 class SIGReg(torch.nn.Module):
     """Sketch Isotropic Gaussian Regularizer (single-GPU!)"""
@@ -33,8 +39,55 @@ class SIGReg(torch.nn.Module):
         x_t = (proj @ A).unsqueeze(-1) * self.t
         err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
         statistic = (err @ self.weights) * proj.size(-2)
-        return statistic.mean() # average over projections and time
-    
+        return statistic.mean()  # average over projections and time
+
+
+class DistributedSIGReg(SIGReg):
+    """Distributed variant of SIGReg with global-batch statistics."""
+
+    def _sample_synced_projections(self, dim, device):
+        A = torch.zeros(dim, self.num_proj, device=device)
+        if (
+            not dist.is_available()
+            or not dist.is_initialized()
+            or dist.get_world_size() == 1
+        ):
+            A.normal_()
+            return A.div_(A.norm(p=2, dim=0))
+
+        if dist.get_rank() == 0:
+            A.normal_()
+
+        dist.broadcast(A, src=0)
+        return A.div_(A.norm(p=2, dim=0))
+
+    def _gather_proj(self, proj):
+        if (
+            not dist.is_available()
+            or not dist.is_initialized()
+            or dist.get_world_size() == 1
+        ):
+            return proj
+
+        gathered = dist_nn.all_gather(proj)
+        return torch.cat(gathered, dim=1)
+
+    def forward(self, proj):
+        """
+        proj: (T, B, D)
+        """
+        proj = self._gather_proj(proj)
+        A = self._sample_synced_projections(proj.size(-1), proj.device)
+
+        t = cast(torch.Tensor, self.t)
+        phi = cast(torch.Tensor, self.phi)
+        weights = cast(torch.Tensor, self.weights)
+        x_t = (proj @ A).unsqueeze(-1) * t
+        err = (x_t.cos().mean(-3) - phi).square() + x_t.sin().mean(-3).square()
+        statistic = (err @ weights) * proj.size(-2)
+        return statistic.mean()
+
+
 class FeedForward(nn.Module):
     """FeedForward network used in Transformers"""
 
@@ -186,15 +239,12 @@ class Transformer(nn.Module):
             x = self.output_proj(x)
         return x
 
+
 # Changed from original implmentation
-    # Actions
-    # Continous -> Discrete
+# Actions
+# Continous -> Discrete
 class Embedder(nn.Module):
-    def __init__(
-        self,
-        num_actions,
-        emb_dim=192
-    ):
+    def __init__(self, num_actions, emb_dim=192):
         super().__init__()
         self.embed = nn.Embedding(num_actions, emb_dim)
 
