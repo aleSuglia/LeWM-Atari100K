@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+
 class Replay:
     """Simple inspectable one-game HDF5 replay store.
 
@@ -21,7 +22,7 @@ class Replay:
     Episode-level datasets:
         ep_len:      (num_episodes,)
         ep_offset:   (num_episodes,)
-    
+
     mode='w' so that each time you run the train, the file is re-written, if 'a', its only append
     """
 
@@ -209,6 +210,7 @@ class Replay:
     def __exit__(self, exc_type, exc, tb):
         self.close()
 
+
 class ReplaySequenceDataset(Dataset):
     """Read-only Dataset that returns fixed-length replay sequences.
 
@@ -223,7 +225,7 @@ class ReplaySequenceDataset(Dataset):
         episode_idx: [T]
         step_idx:    [T]
 
-    If allow_cross_episode=False (default), ep_offset and ep_len are 
+    If allow_cross_episode=False (default), ep_offset and ep_len are
         used to avoid sequences that cross episode boundaries.
 
     This dataset supports refresh() so it can be reused while the underlying
@@ -313,7 +315,7 @@ class ReplaySequenceDataset(Dataset):
                     valid_starts.append(start)
 
             valid_starts = np.asarray(valid_starts, dtype=np.int64)
-        
+
         return valid_starts
 
     def _build_chosen_starts(self):
@@ -326,11 +328,17 @@ class ReplaySequenceDataset(Dataset):
         num_anywhere = num_chosen - num_second_half
 
         second_half_starts = self.valid_starts[self.valid_starts >= self.num_steps // 2]
+        if len(second_half_starts) == 0:
+            second_half_starts = self.valid_starts
 
-        chosen_starts = np.concatenate([
-            np.random.choice(second_half_starts, size=num_second_half, replace=True),
-            np.random.choice(self.valid_starts, size=num_anywhere, replace=True),
-        ])
+        chosen_starts = np.concatenate(
+            [
+                np.random.choice(
+                    second_half_starts, size=num_second_half, replace=True
+                ),
+                np.random.choice(self.valid_starts, size=num_anywhere, replace=True),
+            ]
+        )
         np.random.shuffle(chosen_starts)
 
         return chosen_starts.astype(np.int64)

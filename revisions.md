@@ -34,5 +34,5 @@ Date: 2026-07-09
   - Guard real interaction collection with inference mode.
   - Rebind imagination env world model/device after Accelerate prepare.
   - Gate distributed SIGReg by global process count.
-- [ ] (Optional next) Fix replay write shape mismatch.
-- [ ] (Optional next) Fix empty second-half replay sampler fallback.
+- [x] Fix replay write shape mismatch.
+- [x] Fix empty second-half replay sampler fallback.

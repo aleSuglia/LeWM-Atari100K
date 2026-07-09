@@ -26,7 +26,6 @@ def _normalize_mixed_precision(precision):
     return "no"
 
 
-@torch.no_grad()
 @torch.inference_mode()
 def collect_real_interactions(
     num_interactions,
@@ -63,7 +62,7 @@ def collect_real_interactions(
 
         done = int(terminated or truncated)
         writer.append(
-            obs_tensor.cpu().numpy(),
+            obs,
             action,
             reward,
             done,

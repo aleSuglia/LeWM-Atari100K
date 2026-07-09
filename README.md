@@ -15,8 +15,9 @@ uv sync
 You can use the prebuilt config files in `accelerate_configs/`:
 
 - `cpu.yaml`: CPU-only debug mode
-- `single_gpu.yaml`: one GPU
-- `multi_gpu.yaml`: multi-GPU on one node (default `num_processes: 4`)
+- `cuda_single_gpu.yaml`: one NVIDIA CUDA GPU
+- `mps.yaml`: Apple Silicon MPS (single process)
+- `multi_gpu.yaml`: multi-GPU on one node (CUDA/NCCL environments)
 
 Optional: generate your own config interactively.
 
@@ -44,10 +45,16 @@ Standard full schedule with CPU profile:
 uv run accelerate launch --config_file accelerate_configs/cpu.yaml train.py mode=standard
 ```
 
-Single GPU:
+CUDA single GPU:
 
 ```bash
-uv run accelerate launch --config_file accelerate_configs/single_gpu.yaml train.py
+uv run accelerate launch --config_file accelerate_configs/cuda_single_gpu.yaml train.py
+```
+
+Apple Silicon MPS:
+
+```bash
+uv run accelerate launch --config_file accelerate_configs/mps.yaml train.py
 ```
 
 Multi-GPU (uses `accelerate_configs/multi_gpu.yaml`):
@@ -61,6 +68,11 @@ For a different GPU count, either edit `num_processes` in the YAML file or overr
 ```bash
 uv run accelerate launch --config_file accelerate_configs/multi_gpu.yaml --num_processes 8 train.py
 ```
+
+Notes:
+
+- Treat "GPU" in this repository as CUDA unless MPS is explicitly named.
+- On macOS/Apple Silicon, prefer `mps.yaml`.
 
 Hydra overrides still work when appended to the command, for example:
 
